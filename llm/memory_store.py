@@ -95,14 +95,18 @@ _encoder = None
 _supabase = None
 
 
+_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
+_EMBEDDING_DIM = 1024 if "bge-m3" in _EMBEDDING_MODEL else 384
+
+
 def _get_encoder():
-    """Lazy-load the sentence-transformer model (384-dim, CPU-friendly)."""
+    """Lazy-load the sentence-transformer model. Defaults to BGE-M3 (1024-dim)."""
     global _encoder
     if _encoder is None:
         try:
             from sentence_transformers import SentenceTransformer
-            _encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-            logger.info("RAG memory encoder loaded: all-MiniLM-L6-v2")
+            _encoder = SentenceTransformer(_EMBEDDING_MODEL)
+            logger.info("RAG memory encoder loaded: %s (%d-dim)", _EMBEDDING_MODEL, _EMBEDDING_DIM)
         except ImportError:
             logger.warning("sentence-transformers not installed — RAG memory disabled. "
                            "Run: pip3 install sentence-transformers")
@@ -134,7 +138,7 @@ def prewarm_encoder():
 
 
 def _embed(text: str) -> Optional[list[float]]:
-    """Generate a 384-dim embedding for the given text."""
+    """Generate an embedding for the given text (dimension depends on model)."""
     enc = _get_encoder()
     if enc is None:
         return None
@@ -147,7 +151,7 @@ def _embed(text: str) -> Optional[list[float]]:
 
 
 def _embed_batch(texts: list[str]) -> list[Optional[list[float]]]:
-    """Generate 384-dim embeddings for multiple texts in one batch call."""
+    """Generate embeddings for multiple texts in one batch call."""
     enc = _get_encoder()
     if enc is None:
         return [None] * len(texts)

@@ -32,6 +32,7 @@ MIGRATIONS=(
     "005_memory_cleanup_and_index.sql"
     "006_ebbinghaus_forgetting.sql"
     "007_template_rewards.sql"
+    "008_bge_m3_embeddings.sql"
 )
 
 echo "-- ═══════════════════════════════════════════════════════════"

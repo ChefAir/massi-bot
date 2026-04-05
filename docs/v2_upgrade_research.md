@@ -24,12 +24,12 @@ The blueprint proposed 9 upgrades. After deep research, here's what's real and w
 | 8 | **Semantic caching (Redis)** | FREE | Medium | Only 10-20% hit rate | SKIP |
 | 9 | **Mem0/Engram memory** | FREE-CHEAP | Medium | 80% redundant with current system | SKIP |
 
-**Skipped from blueprint** (too expensive / research-grade / not production-ready):
-- JEPA behavioral prediction (6-10 weeks, custom research, $$$)
-- Mamba-3 state tracking (no dialogue benchmarks exist, research gap)
-- Neuro-symbolic sales logic / HCN action masks (cool but overkill — our guardrails already do this)
-- KTO/RUDDER reinforcement learning ($8K+ in inference for data gen, 500-1000 A100-hours)
-- LoRA persona adapters (need self-hosted GPU, breakeven at 2100 msgs/day — we're below that)
+**Deferred for Future** (too expensive or research-grade for current scale — revisit as volume grows):
+- **JEPA behavioral prediction** — Forecast spending intent from conversation patterns. LeJEPA SIGReg makes training feasible. Wait until message volume justifies engineering. (6-10 weeks, GitHub: facebookresearch/jepa)
+- **Mamba-3 state tracking** — Complex-valued states for FSM prediction. Mamba4Rec shows sequential user modeling potential. No dialogue benchmarks yet. (GitHub: state-spaces/mamba)
+- **Neuro-symbolic sales logic / HCN action masks** — Encode Cialdini principles as verifiable constraints. Our guardrails already handle 80%. Consider when guardrail rejection rate is high. (Ref: XGrammar, Hybrid Code Networks)
+- **KTO/RUDDER reinforcement learning** — Revenue-to-training signal without paired preferences. REFUEL eliminates covariate shift. Need 10K+ conversation logs with revenue outcomes first. ($8K+ initial, GitHub: stanfordnlp/dspy)
+- **LoRA persona adapters** — 10 persona LoRAs via vLLM S-LoRA. $15-50 total training cost but need self-hosted GPU. Breakeven at ~2100 msgs/day. (GitHub: vllm-project/vllm)
 
 ---
 
@@ -263,13 +263,16 @@ Need a fitness function. Can start with LLM-as-judge (Claude Haiku evaluates "wo
 6. **DSPy compilation** — Build eval dataset, run optimizer. [$15-35 per cycle]
 7. **EvoPrompt** — Build fitness function, evolve templates. [$2-10 per cycle]
 
-### Skipped (not worth it for our scale)
+### Skipped (not worth it at current scale)
 - Semantic caching (10-20% hit rate, wrong pattern for contextual chatbot)
 - Mem0/Engram (80% redundant with our existing pgvector setup)
-- JEPA (research-grade, 6-10 weeks, needs custom models)
-- Mamba-3 (no dialogue benchmarks, research gap)
-- KTO/RL ($8K+ upfront, 500+ GPU-hours)
-- LoRA personas (need self-hosted GPU, breakeven at 2100 msgs/day)
+
+### Deferred for Future (revisit as volume grows)
+- JEPA behavioral prediction (research-grade, 6-10 weeks, needs custom models)
+- Mamba-3 state tracking (no dialogue benchmarks yet, research gap)
+- KTO/RUDDER RL ($8K+ upfront, need 10K+ conversation logs)
+- LoRA persona adapters (need self-hosted GPU, breakeven at 2100 msgs/day)
+- Neuro-symbolic sales logic (our guardrails already handle 80% of this)
 
 ---
 

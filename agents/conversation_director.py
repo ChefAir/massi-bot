@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'engine'))
 
 from models import Subscriber
 
+from llm.prompt_cache import split_system_prompt, build_cached_system_message
+
 logger = logging.getLogger(__name__)
 
 _MODEL = os.environ.get("DIRECTOR_MODEL", "anthropic/claude-haiku-4-5-20251001")
@@ -518,8 +520,10 @@ async def generate_response(
 {do_not_repeat}
 # ═══════════════════════════════════════════════════════════════"""
 
-        # Build messages array with conversation history
-        llm_messages = [{"role": "system", "content": system_prompt}]
+        # Build messages array with prompt caching for Anthropic models
+        static_part, dynamic_part = split_system_prompt(system_prompt)
+        system_msg = build_cached_system_message(static_part, dynamic_part, model=_MODEL)
+        llm_messages = [system_msg]
 
         # Add last 20 conversation messages (expanded from 10 for better context)
         history = all_history[-20:]
