@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Validator client (Claude via OpenRouter)
 # ─────────────────────────────────────────────
 
-_VALIDATOR_MODEL = "anthropic/claude-opus-4-6"
+_VALIDATOR_MODEL = os.environ.get("LLM_VALIDATOR_MODEL", "anthropic/claude-haiku-4-5-20251001")
 _VALIDATOR_TIMEOUT = 10.0  # seconds — must be fast
 
 _validator_client: Optional[AsyncOpenAI] = None

@@ -25,7 +25,7 @@ from models import Subscriber
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "anthropic/claude-opus-4-6"
+_MODEL = os.environ.get("STRATEGIST_MODEL", "google/gemini-2.5-flash")
 _TIMEOUT = 15.0
 _MAX_TOKENS = 400
 

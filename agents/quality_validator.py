@@ -18,7 +18,7 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "anthropic/claude-opus-4-6"
+_MODEL = os.environ.get("VALIDATOR_MODEL", "mistralai/mistral-small-3.1-24b-instruct")
 _TIMEOUT = 10.0
 _MAX_TOKENS = 150
 

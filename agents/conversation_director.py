@@ -27,7 +27,7 @@ from models import Subscriber
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "anthropic/claude-opus-4-6"
+_MODEL = os.environ.get("DIRECTOR_MODEL", "anthropic/claude-haiku-4-5-20251001")
 _TIMEOUT = 20.0
 _MAX_TOKENS = 300
 

@@ -352,15 +352,19 @@ async def retrieve_memories(
         }).execute()
 
         rows = result.data or []
-        # Update last_accessed for retrieved rows (fire-and-forget)
+        # Update last_accessed + increment recall_count for Ebbinghaus forgetting curve
         ids = [r["id"] for r in rows if "id" in r]
         if ids:
             try:
-                sb.table("subscriber_memory").update({
-                    "last_accessed": datetime.now().isoformat()
-                }).in_("id", ids).execute()
+                sb.rpc("touch_memory_recall", {"p_ids": ids}).execute()
             except Exception:
-                pass  # Non-critical
+                # Fallback if RPC not deployed yet
+                try:
+                    sb.table("subscriber_memory").update({
+                        "last_accessed": datetime.now().isoformat()
+                    }).in_("id", ids).execute()
+                except Exception:
+                    pass  # Non-critical
 
         facts = []
         for r in rows:
@@ -408,15 +412,19 @@ async def retrieve_memories_with_metadata(
         }).execute()
 
         rows = result.data or []
-        # Update last_accessed for retrieved rows (fire-and-forget)
+        # Update last_accessed + increment recall_count for Ebbinghaus forgetting curve
         ids = [r["id"] for r in rows if "id" in r]
         if ids:
             try:
-                sb.table("subscriber_memory").update({
-                    "last_accessed": datetime.now().isoformat()
-                }).in_("id", ids).execute()
+                sb.rpc("touch_memory_recall", {"p_ids": ids}).execute()
             except Exception:
-                pass  # Non-critical
+                # Fallback if RPC not deployed yet
+                try:
+                    sb.table("subscriber_memory").update({
+                        "last_accessed": datetime.now().isoformat()
+                    }).in_("id", ids).execute()
+                except Exception:
+                    pass  # Non-critical
 
         return rows
 

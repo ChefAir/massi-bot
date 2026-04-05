@@ -287,7 +287,7 @@ class LLMClient:
                 timeout=20.0,  # Opus may be slightly slower
             )
             completion = await client.chat.completions.create(
-                model="anthropic/claude-opus-4-6",
+                model=os.environ.get("OPUS_MODEL", "anthropic/claude-sonnet-4-6"),
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
