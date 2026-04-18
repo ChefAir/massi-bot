@@ -27,7 +27,7 @@ from connector.media_handler import MediaAnalysis
 
 logger = logging.getLogger(__name__)
 
-_MODEL = os.environ.get("MEDIA_REACTOR_MODEL", "mistralai/mistral-small-3.1-24b-instruct")
+_MODEL = os.environ.get("MEDIA_REACTOR_MODEL", "anthropic/claude-opus-4-6")
 _TIMEOUT = 15.0
 _MAX_TOKENS = 150
 _TEMPERATURE = 0.8

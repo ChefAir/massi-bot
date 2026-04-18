@@ -5,7 +5,7 @@ FastAPI app (port 8000) that:
   1. Receives 6 Fanvue webhook event types
   2. Verifies HMAC-SHA256 signatures (X-Fanvue-Signature: t=...,v0=...)
   3. Loads/saves subscriber state from Supabase
-  4. Feeds events into the 5-agent orchestrator pipeline
+  4. Feeds events into the single-agent orchestrator
   5. Executes BotActions (send_message, send_ppv) with mandatory delays
   6. Handles OAuth 2.0 PKCE callback for initial token setup
 
@@ -24,6 +24,7 @@ import logging
 import asyncio
 import secrets
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Optional, Dict
 
 import redis as _redis_lib
@@ -94,6 +95,7 @@ class ModelContext:
     attribution: Optional[object] = None    # AttributionEngine
     default_avatar: str = "luxury_baddie"   # Fallback avatar for this model
     stage_name: str = ""                    # For logging
+    active_tier_count: int = 6             # Number of active tiers (3 = GFE+tease only, 6 = full pipeline)
 
 
 _avatars: Dict[str, AvatarConfig] = {}   # Shared across all models
@@ -108,6 +110,66 @@ _fallback_model_id: Optional[str] = None
 _sub_locks: Dict[str, asyncio.Lock] = {}
 _sub_queued_messages: Dict[str, list] = {}  # fan_uuid → [queued message texts]
 _processed_message_uuids: Dict[str, bool] = {}  # messageUuid → True (dedup, max 500)
+
+# Adaptive settle window — wait for fan to stop typing before starting pipeline
+_sub_last_msg_time: Dict[str, float] = {}
+
+
+def _settle_initial_seconds() -> float:
+    try:
+        return float(os.environ.get("MESSAGE_SETTLE_INITIAL_SECONDS", "8"))
+    except ValueError:
+        return 8.0
+
+
+def _settle_extension_seconds() -> float:
+    try:
+        return float(os.environ.get("MESSAGE_SETTLE_EXTENSION_SECONDS", "5"))
+    except ValueError:
+        return 5.0
+
+
+def _settle_max_seconds() -> float:
+    try:
+        return float(os.environ.get("MESSAGE_SETTLE_MAX_SECONDS", "30"))
+    except ValueError:
+        return 30.0
+
+
+async def _wait_for_settle(platform_user_id: str) -> None:
+    """
+    Wait for the fan to finish typing before starting the pipeline.
+    Initial: 8s. Extends 5s per new message. Max 30s total.
+    Fanvue doesn't have typing indicators but the orchestrator will fire one when it starts.
+    """
+    import time as _time
+    initial = _settle_initial_seconds()
+    extension = _settle_extension_seconds()
+    max_total = _settle_max_seconds()
+
+    start = _time.monotonic()
+    first_msg_time = _sub_last_msg_time.get(platform_user_id, start)
+    target_wake = first_msg_time + initial
+
+    while True:
+        now = _time.monotonic()
+        elapsed = now - start
+        if elapsed >= max_total:
+            logger.debug("Settle hit max cap %.1fs for %s", max_total, platform_user_id[:8])
+            return
+        sleep_for = target_wake - now
+        if sleep_for <= 0:
+            latest_msg = _sub_last_msg_time.get(platform_user_id, first_msg_time)
+            if latest_msg > first_msg_time:
+                first_msg_time = latest_msg
+                target_wake = latest_msg + extension
+                continue
+            return
+        await asyncio.sleep(min(sleep_for, 1.0))
+        latest_msg = _sub_last_msg_time.get(platform_user_id, first_msg_time)
+        if latest_msg > first_msg_time:
+            first_msg_time = latest_msg
+            target_wake = latest_msg + extension
 
 
 def _get_sub_lock(fan_uuid: str) -> asyncio.Lock:
@@ -191,36 +253,31 @@ def _build_model_context(model_id: str, creator_uuid: str) -> ModelContext:
     """Build a ModelContext for a single model."""
     profile = load_model_profile(model_id)
 
-    # Per-model IG attribution (from profile_json or env var fallback)
-    ig_map_json = "{}"
+    # Load profile_json once for all per-model config
+    pj = {}
     if profile:
         try:
             db = get_supabase()
             result = db.table("models").select("profile_json").eq("id", model_id).limit(1).execute()
             if result.data:
                 pj = result.data[0].get("profile_json") or {}
-                ig_map_raw = pj.get("ig_map", {})
-                if ig_map_raw:
-                    ig_map_json = json.dumps(ig_map_raw)
         except Exception:
             pass
+
+    # Per-model IG attribution
+    ig_map_json = "{}"
+    ig_map_raw = pj.get("ig_map", {})
+    if ig_map_raw:
+        ig_map_json = json.dumps(ig_map_raw)
     if ig_map_json == "{}":
         ig_map_json = os.environ.get("FANVUE_IG_MAP", "{}")
     attribution = build_attribution(ig_map_json, _avatars)
 
-    # Determine default avatar for this model
-    default_avatar = "luxury_baddie"  # System default
-    if profile:
-        try:
-            db = get_supabase()
-            result = db.table("models").select("profile_json").eq("id", model_id).limit(1).execute()
-            if result.data:
-                pj = result.data[0].get("profile_json") or {}
-                pj_avatar = pj.get("default_avatar")
-                if pj_avatar:
-                    default_avatar = pj_avatar
-        except Exception:
-            pass
+    # Per-model default avatar
+    default_avatar = pj.get("default_avatar", "luxury_baddie")
+
+    # Per-model active tier count (default 6, set to 3 for models with limited content)
+    active_tier_count = pj.get("active_tier_count", 6)
 
     return ModelContext(
         model_id=model_id,
@@ -229,6 +286,7 @@ def _build_model_context(model_id: str, creator_uuid: str) -> ModelContext:
         attribution=attribution,
         default_avatar=default_avatar,
         stage_name=profile.stage_name if profile else model_id[:8],
+        active_tier_count=active_tier_count,
     )
 
 
@@ -303,6 +361,13 @@ async def startup():
     except Exception:
         pass
 
+    # Start PPV auto-cleanup sweep (6h default abandonment, configurable via PPV_ABANDONMENT_HOURS)
+    try:
+        from connector.ppv_cleanup import start_sweep_loop
+        asyncio.create_task(start_sweep_loop(PLATFORM, delete_fanvue_message))
+    except Exception as e:
+        logger.warning("PPV cleanup sweep failed to start: %s", e)
+
     logger.info("Fanvue connector started (%d models loaded, %d avatars)",
                 len(_model_contexts), len(_avatars))
 
@@ -364,50 +429,152 @@ async def _get_headers(creator_uuid: str = "") -> dict:
 
 
 async def send_fanvue_message(creator_uuid: str, user_uuid: str, text: str) -> None:
-    """Send a plain text message to a subscriber. Token is per-creator."""
+    """Send a plain text message to a subscriber. Token is per-creator.
+    1-retry on network timeout + catches all exceptions so callers never crash."""
     if not creator_uuid:
         logger.error("Cannot send message -- no creator_uuid")
         return
     headers = await _get_headers(creator_uuid)
     url = f"{API_BASE}/chats/{user_uuid}/message"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(url, json={"text": text}, headers=headers)
-    if resp.status_code not in (200, 201):
-        logger.error("send_message failed %d: %s", resp.status_code, resp.text[:200])
-    else:
-        logger.debug("Sent message to %s", user_uuid)
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, json={"text": text}, headers=headers)
+            if resp.status_code not in (200, 201):
+                logger.error("send_message failed %d: %s | text_sent=%s", resp.status_code, resp.text[:200], text[:200])
+                try:
+                    from admin_bot.alerts import _send
+                    asyncio.create_task(_send(
+                        f"⚠️ <b>Fanvue Message Rejected</b>\n"
+                        f"User: <code>{user_uuid[:12]}</code>\n"
+                        f"Status: {resp.status_code}\n"
+                        f"Text: <i>{text[:150]}</i>\n"
+                        f"Error: {resp.text[:150]}"
+                    ))
+                except Exception:
+                    pass
+            else:
+                logger.debug("Sent message to %s", user_uuid)
+            return
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            if attempt == 0:
+                logger.warning("Fanvue send_message timeout/network err (attempt 1), retrying in 2s: %s", e)
+                await asyncio.sleep(2)
+                continue
+            logger.error("Fanvue send_message failed after retry: %s", e)
+            return
+        except Exception as e:
+            logger.error("Fanvue send_message unexpected error: %s", e)
+            return
 
 
 async def send_fanvue_ppv(
     creator_uuid: str,
     user_uuid: str,
     caption: str,
-    fanvue_media_uuid: str,
+    fanvue_media_uuids: list[str] | str,
     price_cents: int,
-) -> None:
+) -> Optional[str]:
     """
     Send a PPV message to a single subscriber.
     Prices must be in CENTS (e.g. $27.38 -> 2738).
+    Accepts a single UUID string or a list of UUIDs for multi-media bundles.
+
+    Returns the Fanvue message UUID on success (for later deletion), None on failure.
     """
     if not creator_uuid:
         logger.error("Cannot send PPV -- no creator_uuid")
-        return
+        return None
+    # Normalize to list
+    if isinstance(fanvue_media_uuids, str):
+        fanvue_media_uuids = [fanvue_media_uuids]
     headers = await _get_headers(creator_uuid)
     url = f"{API_BASE}/chats/{user_uuid}/message"
     payload = {
         "text": caption,
-        "mediaUuids": [fanvue_media_uuid],
+        "mediaUuids": fanvue_media_uuids,
         "price": price_cents,
     }
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+    # PPV sends get aggressive retry — a failed PPV is a lost sale.
+    # Retry on: timeouts, network errors, AND server errors (500/502/503/504).
+    # Backoff: 2s, 10s, 30s (3 retries total).
+    _PPV_RETRY_DELAYS = [2, 10, 30]
+    resp = None
+    for attempt in range(len(_PPV_RETRY_DELAYS) + 1):
+        try:
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code in (200, 201):
+                break
+            if resp.status_code >= 500 and attempt < len(_PPV_RETRY_DELAYS):
+                delay = _PPV_RETRY_DELAYS[attempt]
+                logger.warning("Fanvue send_ppv server error %d (attempt %d), retrying in %ds: %s",
+                               resp.status_code, attempt + 1, delay, resp.text[:100])
+                await asyncio.sleep(delay)
+                continue
+            break
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            if attempt < len(_PPV_RETRY_DELAYS):
+                delay = _PPV_RETRY_DELAYS[attempt]
+                logger.warning("Fanvue send_ppv timeout/network err (attempt %d), retrying in %ds: %s",
+                               attempt + 1, delay, e)
+                await asyncio.sleep(delay)
+                continue
+            logger.error("Fanvue send_ppv failed after %d retries for user %s: %s", attempt + 1, user_uuid, e)
+            return None
+        except Exception as e:
+            logger.error("Fanvue send_ppv unexpected error for user %s: %s", user_uuid, e)
+            return None
+    if resp is None:
+        return None
     if resp.status_code not in (200, 201):
         logger.error(
-            "send_ppv failed %d for user %s: %s",
+            "send_ppv failed %d for user %s after all retries: %s",
             resp.status_code, user_uuid, resp.text[:200],
         )
-    else:
-        logger.info("Sent PPV %d cents to %s", price_cents, user_uuid)
+        try:
+            from admin_bot.alerts import _send
+            asyncio.create_task(_send(
+                f"🚨 <b>Fanvue PPV Send FAILED</b>\n"
+                f"User: <code>{user_uuid[:12]}</code>\n"
+                f"Price: {price_cents} cents\n"
+                f"Status: {resp.status_code}\n"
+                f"Error: {resp.text[:150]}\n\n"
+                f"PPV was NOT delivered. Fan may be waiting."
+            ))
+        except Exception:
+            pass
+        return None
+    logger.info("Sent PPV %d cents (%d media) to %s", price_cents, len(fanvue_media_uuids), user_uuid)
+    try:
+        data = resp.json()
+        # Fanvue returns the created message; extract its uuid
+        return data.get("uuid") or data.get("data", {}).get("uuid") or data.get("messageUuid")
+    except Exception:
+        return None
+
+
+async def delete_fanvue_message(
+    creator_uuid: str,
+    user_uuid: str,
+    message_uuid: str,
+) -> bool:
+    """Delete a previously-sent message from the chat. Returns True on success."""
+    if not creator_uuid or not message_uuid:
+        return False
+    try:
+        headers = await _get_headers(creator_uuid)
+        url = f"{API_BASE}/chats/{user_uuid}/messages/{message_uuid}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.delete(url, headers=headers)
+        if resp.status_code in (200, 204):
+            logger.info("Fanvue delete OK: msg=%s user=%s", message_uuid, user_uuid)
+            return True
+        logger.warning("Fanvue delete failed %d: %s", resp.status_code, resp.text[:200])
+        return False
+    except Exception as e:
+        logger.warning("Fanvue delete error: %s", e)
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -529,8 +696,37 @@ async def execute_actions(
     """
     Execute a list of BotActions against the Fanvue API.
     Honors each action's delay_seconds -- mandatory per engine design.
+
+    Also handles GFE-kick force-delete: if sub._force_delete_pending_ppv is set
+    (orchestrator flagged a PPV for immediate deletion when kicking to GFE), we DELETE it
+    before running the action list.
     """
+    # GFE-kick force-delete: happens BEFORE sending actions so the chat is cleaned up first
+    pending_to_delete = getattr(sub, "_force_delete_pending_ppv", None)
+    if pending_to_delete:
+        msg_uuid = pending_to_delete.get("platform_msg_id")
+        del_creator = pending_to_delete.get("creator_uuid") or creator_uuid
+        if msg_uuid and del_creator:
+            try:
+                ok = await delete_fanvue_message(del_creator, platform_user_id, msg_uuid)
+                logger.info("GFE-kick force-delete: msg=%s user=%s success=%s",
+                            msg_uuid, platform_user_id, ok)
+            except Exception as e:
+                logger.warning("GFE-kick force-delete failed: %s", e)
+        sub._force_delete_pending_ppv = None
+
     for action in actions:
+      # Per-action try/except: one action failing must NOT kill subsequent actions.
+      try:
+        # Belt-and-suspenders: continuation PPVs should NEVER have a multi-minute jitter.
+        # If a continuation bundle somehow has >60s delay, cap it (pre-taken content, no realness needed).
+        if action.action_type == "send_ppv" and action.metadata:
+            tier_meta = action.metadata.get("tier", "")
+            if tier_meta == "continuation" and action.delay_seconds > 60:
+                logger.warning("Continuation PPV had %ds delay — capping to 10s",
+                               action.delay_seconds)
+                action.delay_seconds = random.randint(5, 10)
+
         if action.delay_seconds > 0:
             await asyncio.sleep(action.delay_seconds)
 
@@ -538,6 +734,29 @@ async def execute_actions(
             await send_fanvue_message(creator_uuid, platform_user_id, action.message)
 
         elif action.action_type == "send_ppv":
+            # Custom payment PPV — use a continuation photo as placeholder
+            if (action.metadata or {}).get("use_continuation_placeholder") or (action.metadata or {}).get("tier") == "custom":
+                try:
+                    db = get_supabase()
+                    r = db.table("content_catalog").select("fanvue_media_uuid").eq("model_id", model_id).eq("tier", 0).eq("media_type", "photo").limit(1).execute()
+                    placeholder_uuid = (r.data[0]["fanvue_media_uuid"] if r.data else None)
+                    if placeholder_uuid:
+                        price_cents = round((action.ppv_price or 0) * 100)
+                        sent_msg_uuid = await send_fanvue_ppv(
+                            creator_uuid, platform_user_id,
+                            action.ppv_caption or "custom order payment -- unlock to confirm",
+                            [placeholder_uuid], price_cents,
+                        )
+                        logger.info("Custom payment PPV sent: $%.2f to %s (placeholder=%s)",
+                                    action.ppv_price, platform_user_id, placeholder_uuid[:12])
+                    else:
+                        logger.warning("No continuation photo for custom PPV placeholder — sending caption only")
+                        if action.ppv_caption:
+                            await send_fanvue_message(creator_uuid, platform_user_id, action.ppv_caption)
+                except Exception as e:
+                    logger.warning("Custom PPV send failed: %s", e)
+                continue
+
             bundle_info = None
             if action.content_id:
                 bundle_info = get_bundle_by_id(action.content_id, model_id)
@@ -572,17 +791,38 @@ async def execute_actions(
                     tier_num = int(tier_str.split("_")[-1]) if tier_str.startswith("tier_") else 0
                     if tier_num:
                         try:
+                            # Session-scoped lookup — stay in the fan's current session until completion
+                            current_session = getattr(sub, "current_session_number", 1) or 1
                             db = get_supabase()
-                            r = db.table("content_catalog").select("*").eq("model_id", model_id).eq("tier", tier_num).limit(1).execute()
+                            r = (db.table("content_catalog")
+                                   .select("*")
+                                   .eq("model_id", model_id)
+                                   .eq("tier", tier_num)
+                                   .eq("session_number", current_session)
+                                   .execute())
                             if r.data:
                                 bundle_info = r.data[0]
-                                logger.info("Tier %d bundle found: %s", tier_num, bundle_info.get("bundle_id"))
+                                # Collect ALL media UUIDs for this bundle
+                                bundle_id = bundle_info.get("bundle_id")
+                                all_media = [row["fanvue_media_uuid"] for row in r.data
+                                             if row.get("fanvue_media_uuid") and row.get("bundle_id") == bundle_id]
+                                bundle_info["_all_media_uuids"] = all_media
+                                logger.info("Session %d tier %d bundle found: %s (%d media)",
+                                            current_session, tier_num, bundle_id, len(all_media))
+                            else:
+                                logger.warning("No content for session %d tier %d — session gap for sub %s",
+                                               current_session, tier_num, platform_user_id)
                         except Exception as e:
                             logger.warning("Tier lookup failed: %s", e)
 
-            fanvue_media_uuid = (bundle_info or {}).get("fanvue_media_uuid")
+            # Collect media UUIDs — prefer full bundle, fall back to single
+            fanvue_media_uuids = (bundle_info or {}).get("_all_media_uuids") or []
+            if not fanvue_media_uuids:
+                single_uuid = (bundle_info or {}).get("fanvue_media_uuid")
+                if single_uuid:
+                    fanvue_media_uuids = [single_uuid]
 
-            if not fanvue_media_uuid:
+            if not fanvue_media_uuids:
                 logger.warning(
                     "No Fanvue media UUID for bundle %s -- sending caption only",
                     action.content_id,
@@ -591,19 +831,49 @@ async def execute_actions(
                     await send_fanvue_message(creator_uuid, platform_user_id, action.ppv_caption)
             else:
                 price_cents = round((action.ppv_price or 0) * 100)
-                await send_fanvue_ppv(
+                sent_msg_uuid = await send_fanvue_ppv(
                     creator_uuid,
                     platform_user_id,
                     action.ppv_caption,
-                    fanvue_media_uuid,
+                    fanvue_media_uuids,
                     price_cents,
                 )
+                # Track pending PPV for 6h auto-delete (only selling tiers 1-6, not continuation)
+                tier_meta = (action.metadata or {}).get("tier", "")
+                if sent_msg_uuid and tier_meta.startswith("tier_"):
+                    try:
+                        tier_int = int(tier_meta.split("_")[-1])
+                    except ValueError:
+                        tier_int = 0
+                    if tier_int > 0:
+                        sub.pending_ppv = {
+                            "platform_msg_id": sent_msg_uuid,
+                            "tier": tier_int,
+                            "sent_at": datetime.now().isoformat(),
+                            "bundle_id": (bundle_info or {}).get("bundle_id", ""),
+                            "price_cents": price_cents,
+                            "platform": PLATFORM,
+                            "platform_user_id": platform_user_id,
+                            "creator_uuid": creator_uuid,
+                            "model_id": model_id,
+                        }
+                        # Persist immediately — any queued-message drain that reloads from DB
+                        # must see the pending_ppv flag, or the no-re-drop rule will break.
+                        try:
+                            save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+                        except Exception as e:
+                            logger.warning("save_subscriber after PPV send failed: %s", e)
+                        logger.info("Pending PPV tracked: tier=%d msg=%s for sub %s",
+                                    tier_int, sent_msg_uuid, platform_user_id)
 
         elif action.action_type == "send_free" and action.message:
             await send_fanvue_message(creator_uuid, platform_user_id, action.message)
 
         elif action.action_type == "flag":
             logger.info("FLAG action for %s: %s", platform_user_id, action.metadata)
+      except Exception as exc:
+        logger.exception("Action failed (%s) — continuing with remaining actions: %s",
+                         action.action_type, exc)
 
 
 # ─────────────────────────────────────────────
@@ -814,6 +1084,10 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
                 del _processed_message_uuids[k]
 
     async def handle():
+        # Record message arrival time for adaptive settle window tracking
+        import time as _time
+        _sub_last_msg_time[platform_user_id] = _time.monotonic()
+
         lock = _get_sub_lock(platform_user_id)
 
         # If lock is held, queue this message and return — the active handler will pick it up
@@ -826,6 +1100,10 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
             return
 
         async with lock:
+            # Adaptive settle window INSIDE the lock — prevents concurrent handlers
+            # from racing through their own settle windows and processing separately.
+            await _wait_for_settle(platform_user_id)
+
             logger.info(">>> HANDLE START: user=%s msg=%s media=%s", platform_user_id, (message_text or "[none]")[:50], bool(has_media))
             if _is_engine_paused():
                 logger.info("Engine paused — dropping message from %s", platform_user_id)
@@ -858,10 +1136,10 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
                     avatar = get_avatar(_avatars, sub.persona_id)
 
                     if message_text:
-                        actions = await orchestrator_process_message(sub, message_text, avatar, model_profile=ctx.model_profile)
+                        actions = await orchestrator_process_message(sub, message_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                     elif media_analysis:
                         # Media-only first message -- react to media
-                        actions = await _media_react(sub, avatar, media_analysis, "", model_profile=ctx.model_profile)
+                        actions = await _media_react(sub, avatar, media_analysis, "", model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                     else:
                         actions = []
                 else:
@@ -879,30 +1157,36 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
 
                     if combined_text and media_analysis:
                         # Text + media: process text through orchestrator, then append media reaction
-                        actions = await orchestrator_process_message(sub, combined_text, avatar, model_profile=ctx.model_profile)
-                        media_actions = await _media_react(sub, avatar, media_analysis, combined_text, model_profile=ctx.model_profile)
+                        actions = await orchestrator_process_message(sub, combined_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
+                        media_actions = await _media_react(sub, avatar, media_analysis, combined_text, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                         actions.extend(media_actions)
                     elif combined_text:
-                        actions = await orchestrator_process_message(sub, combined_text, avatar, model_profile=ctx.model_profile)
+                        actions = await orchestrator_process_message(sub, combined_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                     elif media_analysis:
                         # Media-only (no text) -- react via Media Reactor
-                        actions = await _media_react(sub, avatar, media_analysis, "", model_profile=ctx.model_profile)
+                        actions = await _media_react(sub, avatar, media_analysis, "", model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                     else:
                         actions = []
 
                 # Before sending, check if more messages arrived during orchestrator processing.
-                # If so, REGENERATE the response with all messages combined instead of
-                # responding to the first and then separately to the rest.
-                pre_send_queued = _sub_queued_messages.pop(platform_user_id, [])
-                if pre_send_queued and not is_new:
-                    all_text = (message_text or "") + "\n" + "\n".join(pre_send_queued)
-                    all_text = all_text.strip()
-                    if all_text:
-                        logger.info(">>> REGENERATING: %d msgs arrived during processing -- combining all for %s",
-                                    len(pre_send_queued), platform_user_id)
-                        sub = load_subscriber(PLATFORM, platform_user_id, model_id) or sub
-                        avatar = get_avatar(_avatars, sub.persona_id)
-                        actions = await orchestrator_process_message(sub, all_text, avatar, model_profile=ctx.model_profile)
+                # Regenerate up to 2 times combining all queued messages — prevents "fan answered
+                # but I responded as if they hadn't" race conditions.
+                accumulated_text = message_text or ""
+                regen_count = 0
+                max_regens = 2
+                while not is_new and regen_count < max_regens:
+                    pre_send_queued = _sub_queued_messages.pop(platform_user_id, [])
+                    if not pre_send_queued:
+                        break
+                    regen_count += 1
+                    accumulated_text = (accumulated_text + "\n" + "\n".join(pre_send_queued)).strip()
+                    if not accumulated_text:
+                        break
+                    logger.info(">>> REGENERATING (pass %d/%d): %d new msgs arrived -- recomposing for %s",
+                                regen_count, max_regens, len(pre_send_queued), platform_user_id)
+                    sub = load_subscriber(PLATFORM, platform_user_id, model_id) or sub
+                    avatar = get_avatar(_avatars, sub.persona_id)
+                    actions = await orchestrator_process_message(sub, accumulated_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
 
                 logger.info(">>> Got %d actions from orchestrator", len(actions) if actions else 0)
                 save_subscriber(sub, PLATFORM, platform_user_id, model_id)
@@ -916,7 +1200,7 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
                                 len(post_send_queued), platform_user_id)
                     sub = load_subscriber(PLATFORM, platform_user_id, model_id) or sub
                     avatar = get_avatar(_avatars, sub.persona_id)
-                    actions = await orchestrator_process_message(sub, all_follow_up, avatar, model_profile=ctx.model_profile)
+                    actions = await orchestrator_process_message(sub, all_follow_up, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                     save_subscriber(sub, PLATFORM, platform_user_id, model_id)
                     await execute_actions(actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
 
@@ -1043,12 +1327,41 @@ async def webhook_purchase_received(request: Request, background_tasks: Backgrou
                     queued = _sub_queued_messages.pop(platform_user_id, [])
                     if queued:
                         combined = "\n".join(queued)
-                        msg_actions = await orchestrator_process_message(sub, combined, avatar, model_profile=ctx.model_profile)
+                        msg_actions = await orchestrator_process_message(sub, combined, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                         save_subscriber(sub, PLATFORM, platform_user_id, model_id)
                         await execute_actions(msg_actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
                     return
 
-                actions = await orchestrator_process_purchase(sub, amount_dollars, avatar, model_profile=ctx.model_profile)
+                # Custom payment detection — if pending_custom_order exists and this payment
+                # roughly matches the quoted price, it's a custom payment, not a tier purchase.
+                custom_order = getattr(sub, "pending_custom_order", None)
+                if custom_order and custom_order.get("status") in ("pitched", "awaiting_admin_confirm"):
+                    quoted = custom_order.get("quoted_price", 0)
+                    if abs(amount_dollars - quoted) < 5.0:  # within $5 tolerance
+                        logger.info("Custom payment detected: $%.2f matches quoted $%.2f for %s",
+                                    amount_dollars, quoted, platform_user_id)
+                        from engine.custom_orders import mark_fan_paid
+                        sub.pending_custom_order = mark_fan_paid(custom_order)
+                        save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+                        record_transaction(sub.sub_id, model_id, "custom", amount_dollars, PLATFORM, content_ref)
+                        try:
+                            from admin_bot.alerts import alert_custom_payment_claim
+                            await alert_custom_payment_claim(sub, sub.pending_custom_order)
+                        except Exception as e:
+                            logger.warning("Custom payment alert failed: %s", e)
+                        # Send fan confirmation that we're verifying
+                        await send_fanvue_message(creator_uuid, platform_user_id,
+                            "got it baby, let me verify real quick and then I'll start working on your custom for you")
+                        return
+
+                # Fan paid — clear pending_ppv + reset custom streak
+                if sub.pending_ppv:
+                    logger.info("Clearing pending_ppv (tier=%s) after purchase by %s",
+                                sub.pending_ppv.get("tier"), platform_user_id)
+                    sub.pending_ppv = None
+                sub.custom_request_streak = 0
+
+                actions = await orchestrator_process_purchase(sub, amount_dollars, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
 
                 save_subscriber(sub, PLATFORM, platform_user_id, model_id)
                 record_transaction(
@@ -1073,7 +1386,7 @@ async def webhook_purchase_received(request: Request, background_tasks: Backgrou
                     sub = load_subscriber(PLATFORM, platform_user_id, model_id) or sub
                     avatar = get_avatar(_avatars, sub.persona_id)
                     combined = "\n".join(queued)
-                    msg_actions = await orchestrator_process_message(sub, combined, avatar, model_profile=ctx.model_profile)
+                    msg_actions = await orchestrator_process_message(sub, combined, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                     save_subscriber(sub, PLATFORM, platform_user_id, model_id)
                     await execute_actions(msg_actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
 
@@ -1149,7 +1462,7 @@ async def test_simulate_purchase(request: Request, background_tasks: BackgroundT
 
     # MULTI-MODEL: use fallback model for test endpoint
     # Try to get context from payload (may have recipientUuid), else use fallback
-    fallback_uuid = os.environ.get("FANVUE_CREATOR_UUID", "5f3c5121-e5ec-448f-addb-2e962a3dac4e")
+    fallback_uuid = os.environ.get("FANVUE_CREATOR_UUID", "")
     try:
         ctx = _get_model_context(payload)
     except HTTPException:
@@ -1172,7 +1485,12 @@ async def test_simulate_purchase(request: Request, background_tasks: BackgroundT
                 avatar = get_avatar(_avatars, sub.persona_id)
                 logger.info(">>> TEST PURCHASE: fan=%s amount=$%.2f tier=%d", fan_uuid, amount_dollars, tier)
 
-                actions = await orchestrator_process_purchase(sub, amount_dollars, avatar, model_profile=ctx.model_profile)
+                # Fan paid — clear pending_ppv + reset custom streak
+                if sub.pending_ppv:
+                    sub.pending_ppv = None
+                sub.custom_request_streak = 0
+
+                actions = await orchestrator_process_purchase(sub, amount_dollars, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
 
                 save_subscriber(sub, PLATFORM, fan_uuid, model_id)
                 record_transaction(sub.sub_id, model_id, "ppv", amount_dollars, PLATFORM)
@@ -1189,7 +1507,7 @@ async def test_simulate_purchase(request: Request, background_tasks: BackgroundT
                     sub = load_subscriber(PLATFORM, fan_uuid, model_id) or sub
                     avatar = get_avatar(_avatars, sub.persona_id)
                     combined = "\n".join(queued)
-                    msg_actions = await orchestrator_process_message(sub, combined, avatar, model_profile=ctx.model_profile)
+                    msg_actions = await orchestrator_process_message(sub, combined, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                     save_subscriber(sub, PLATFORM, fan_uuid, model_id)
                     await execute_actions(msg_actions, fan_uuid, model_id, sub, creator_uuid=creator_uuid)
 

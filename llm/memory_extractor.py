@@ -87,7 +87,7 @@ async def extract_facts_llm(
             user_content = f"Recent conversation context:\n{context_block}\n\n{user_content}"
 
         completion = await client.chat.completions.create(
-            model="anthropic/claude-haiku-4-5-20251001",
+            model="anthropic/claude-opus-4-6",
             messages=[
                 {"role": "system", "content": _LLM_EXTRACTION_PROMPT},
                 {"role": "user", "content": user_content},

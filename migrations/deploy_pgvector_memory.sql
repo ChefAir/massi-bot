@@ -1,4 +1,4 @@
--- UnityLink pgvector Memory Store Migration
+-- Massi-Bot pgvector Memory Store Migration
 -- Implements Park et al. (2023) memory scoring for subscriber fact retrieval
 -- Run in Supabase SQL Editor
 

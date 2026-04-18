@@ -259,7 +259,7 @@ class MemoryManager:
 
             facts_block = "\n".join(f"- {f}" for f in all_facts)
             completion = await client.chat.completions.create(
-                model="anthropic/claude-haiku-4-5-20251001",
+                model="anthropic/claude-opus-4-6",
                 messages=[
                     {"role": "system", "content": (
                         "Summarize these facts about a person into a 2-3 sentence profile. "

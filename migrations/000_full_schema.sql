@@ -1,4 +1,4 @@
--- UnityLink Full Database Schema
+-- Massi-Bot Full Database Schema
 -- Run in: Supabase Dashboard → SQL Editor
 -- Run this ONCE to create all tables from scratch.
 -- Safe to re-run: uses IF NOT EXISTS throughout.

@@ -1,4 +1,4 @@
-# UnityLink Bot Engine - Python Dependencies
+# Massi-Bot Bot Engine - Python Dependencies
 # Install: pip install -r requirements.txt
 
 # Web framework (connectors)

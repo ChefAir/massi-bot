@@ -283,6 +283,48 @@ class Subscriber:
     gfe_continuation_pending: bool = False   # Waiting for $20 continuation payment
     gfe_continuations_paid: int = 0          # How many continuation fees they've paid
 
+    # PPV realness (Cobalt-Strike jitter + heads-up tracking)
+    ppv_heads_up_count: int = 0              # How many "give me a few minutes" pre-PPV messages sent
+    ppv_threshold_jitter: Optional[int] = None  # Randomized msgs-before-first-PPV (8-14), set once per session
+    last_consent_decline_at_msg_count: Optional[int] = None  # gfe_message_count when fan declined to spend
+
+    # Pending PPV (for 6h auto-delete of unpaid tier drops)
+    # dict: {platform_msg_id: str, tier: int, sent_at: iso_str, bundle_id: str, price: float}
+    pending_ppv: Optional[Dict[str, Any]] = None
+
+    # Multi-session flow — stays at current session until tier 6 paid (advances) or GFE-kick (stays)
+    current_session_number: int = 1
+
+    # Custom request pushback streak (3 consecutive off-ladder asks → allow custom_pitch)
+    custom_request_streak: int = 0
+
+    # Goodbye pattern tracking — learns each fan's departure/return behavior across the relationship
+    # Each entry: {at: iso_str, tier_pending: int, returned_at: iso_str|None, opened_ppv_on_return: bool}
+    goodbye_patterns: List[Dict[str, Any]] = field(default_factory=list)
+
+    # In-flight departure: set when fan signals "gotta go", cleared when they return
+    # Format: {at: iso_str, tier_pending: int|None}
+    in_flight_departure: Optional[Dict[str, Any]] = None
+
+    # Continuation paywall jitter — re-randomized each cycle (25-35 messages)
+    continuation_threshold_jitter: Optional[int] = None
+
+    # Pending custom order (OUT OF BAND from tier ladder)
+    # Shape: {request_text, custom_type, quoted_price, pitched_at, fan_confirmed_paid_at,
+    #         admin_confirmed_at, admin_last_alerted_at, status}
+    # Status: pitched | awaiting_admin_confirm | paid | denied | fulfilled
+    pending_custom_order: Optional[Dict[str, Any]] = None
+
+    # High-value utterance registry (anti-repetition for critical messages)
+    # Keys: category names (money_readiness_ask, ppv_heads_up, etc.)
+    # Values: list of full bot messages sent in that category (FIFO, max 30 each)
+    high_value_utterances: Dict[str, List[str]] = field(default_factory=dict)
+    # Archive: evicted entries stored as {category: [{hash, ts}]} for future A/B analysis
+    high_value_utterances_archive: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
+
+    # Crash recovery
+    last_crash_time: Optional[datetime] = None  # Set when pipeline crashes; cleared on next success
+
     # Conversation history (last N messages for context)
     recent_messages: List[Dict[str, str]] = field(default_factory=list)
 

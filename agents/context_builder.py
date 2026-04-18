@@ -49,10 +49,14 @@ async def build_context(
     # Spending summary
     result["spending_summary"] = _format_spending(sub)
 
-    # Tier progress
+    # Tier progress — prefer ppv_count (actual purchases) over current_loop_number (send counter)
+    # because simulated purchases / webhook delays can leave current_loop out of sync with reality.
+    ppv_count_actual = sub.spending.ppv_count if sub.spending else 0
+    tiers_purchased_code = max(0, (sub.current_loop_number or 1) - 1)
+    tiers_purchased = max(ppv_count_actual, tiers_purchased_code)
     result["tier_progress"] = {
         "current_loop": sub.current_loop_number or 0,
-        "tiers_purchased": max(0, (sub.current_loop_number or 1) - 1),
+        "tiers_purchased": tiers_purchased,
         "total_possible": 6,
         "total_spent": sub.spending.total_spent,
         "is_buyer": sub.spending.is_buyer,
@@ -114,7 +118,232 @@ async def build_context(
     # Callback references (things the fan has told us)
     result["callback_refs"] = sub.callback_references[-10:] if sub.callback_references else []
 
+    # ─────────────────────────────────────────────
+    # SYNTHESIS FIELDS (new) — prose summaries the Director uses to reason about the moment
+    # ─────────────────────────────────────────────
+    try:
+        result["relationship_summary"] = _format_relationship_summary(sub)
+    except Exception as e:
+        logger.debug("relationship_summary failed: %s", e)
+        result["relationship_summary"] = ""
+
+    try:
+        result["session_arc"] = _format_session_arc(sub)
+    except Exception as e:
+        logger.debug("session_arc failed: %s", e)
+        result["session_arc"] = ""
+
+    try:
+        result["open_threads"] = _extract_open_threads(sub)
+    except Exception as e:
+        logger.debug("open_threads failed: %s", e)
+        result["open_threads"] = []
+
+    try:
+        result["tier_content_awareness"] = _format_tier_content_awareness(sub, model_profile)
+    except Exception as e:
+        logger.debug("tier_content_awareness failed: %s", e)
+        result["tier_content_awareness"] = ""
+
     return result
+
+
+def _format_relationship_summary(sub: Subscriber) -> str:
+    """
+    Prose synthesis of the relationship state at this moment.
+    What tier are we on, how much has he paid, what's his buying rhythm, what patterns exist.
+    """
+    lines = []
+
+    # Session position
+    session_num = getattr(sub, "current_session_number", 1) or 1
+    ppv_count = sub.spending.ppv_count if sub.spending else 0
+    total_spent = sub.spending.total_spent if sub.spending else 0
+    # Tier position within CURRENT session
+    tier_position = (ppv_count % 6) + 1  # Next tier he'd see
+    tiers_left_in_session = max(0, 6 - (ppv_count % 6))
+    lines.append(
+        f"Session {session_num}. Next tier to sell: tier {min(tier_position, 6)} of 6. "
+        f"{tiers_left_in_session} tiers remaining in this session if he completes. "
+        f"Total spent: ${total_spent:.2f}."
+    )
+
+    # Buying rhythm
+    if ppv_count > 0:
+        avg_ppv = sub.spending.avg_ppv_price if sub.spending else 0
+        highest = sub.spending.highest_single_purchase if sub.spending else 0
+        rejected = sub.spending.rejected_ppv_count if sub.spending else 0
+        lines.append(
+            f"He has bought {ppv_count} PPV(s). Avg price: ${avg_ppv:.2f}. "
+            f"Highest single: ${highest:.2f}. Rejected PPVs: {rejected}."
+        )
+
+    # Pending PPV
+    pending = getattr(sub, "pending_ppv", None)
+    if pending:
+        try:
+            sent_at = datetime.fromisoformat(pending.get("sent_at", "").replace("Z", "+00:00"))
+            if sent_at.tzinfo is not None:
+                sent_at = sent_at.replace(tzinfo=None)
+            mins_ago = int((datetime.now() - sent_at).total_seconds() / 60)
+            lines.append(
+                f"PENDING PPV: tier {pending.get('tier')}, sent {mins_ago} min ago, not yet paid."
+            )
+        except Exception:
+            lines.append(f"PENDING PPV: tier {pending.get('tier')}, not yet paid.")
+
+    # Goodbye pattern
+    patterns = getattr(sub, "goodbye_patterns", []) or []
+    if patterns:
+        dep_count = len(patterns)
+        gaps = [p.get("gap_hours") for p in patterns if p.get("gap_hours") is not None]
+        avg_gap = round(sum(gaps) / len(gaps), 1) if gaps else None
+        with_ppv = [p for p in patterns if p.get("tier_pending")]
+        open_rate = None
+        if with_ppv:
+            opened = sum(1 for p in with_ppv if p.get("opened_ppv_on_return"))
+            open_rate = round(opened / len(with_ppv) * 100)
+        summary = f"He has said 'brb/gotta go' {dep_count} time(s)."
+        if avg_gap is not None:
+            summary += f" Avg gap: {avg_gap}h."
+        if open_rate is not None:
+            summary += f" He opens pending PPVs on return {open_rate}% of the time."
+        lines.append(summary)
+
+    # Custom request streak
+    streak = getattr(sub, "custom_request_streak", 0)
+    if streak > 0:
+        lines.append(f"He has asked for a custom {streak} time(s) consecutively (3+ = allow custom pitch).")
+
+    # Objection / brokey state
+    tier_no = getattr(sub, "tier_no_count", 0)
+    if tier_no > 0:
+        lines.append(f"He has pushed back on price {tier_no} time(s) this session (3+ = GFE kick).")
+
+    return " ".join(lines) if lines else "First interaction — no history yet."
+
+
+def _format_session_arc(sub: Subscriber) -> str:
+    """
+    Prose timeline of the current session. When did it start, what's happened.
+    """
+    recent = sub.recent_messages or []
+    if not recent:
+        return "Conversation hasn't started yet."
+
+    # First message in history is our approximation of session start
+    first = recent[0] if recent else {}
+    first_content = first.get("content", "")[:60]
+    msg_count = len(recent)
+
+    ppv_count = sub.spending.ppv_count if sub.spending else 0
+    total = sub.spending.total_spent if sub.spending else 0
+
+    lines = [
+        f"Conversation has {msg_count} message(s) in recent history, starting with fan saying '{first_content}'.",
+    ]
+    if ppv_count > 0:
+        lines.append(f"So far he has bought {ppv_count} tier(s) for ${total:.2f}.")
+    else:
+        lines.append("No PPVs bought yet in this session.")
+
+    # Crash recovery flag
+    if getattr(sub, "last_crash_time", None):
+        lines.append("Note: bot went silent at some point and is recovering — apologize naturally if it fits.")
+
+    return " ".join(lines)
+
+
+def _extract_open_threads(sub: Subscriber) -> list[str]:
+    """
+    Surface conversational topics the fan opened that the bot hasn't circled back to.
+    Heuristic: look at fan messages from 2-10 turns ago that mentioned specific topics,
+    check if bot's subsequent messages referenced them.
+
+    Returns a list of short prose descriptions of unclosed threads (max 3).
+    """
+    messages = sub.recent_messages or []
+    if len(messages) < 4:
+        return []
+
+    # Look at fan messages from positions -10 to -3 (skip the very latest 2 turns)
+    fan_history = [m for m in messages[-10:-2] if m.get("role") in ("sub", "user")]
+    if not fan_history:
+        return []
+
+    # Recent bot messages for "has she responded to this" check
+    recent_bot_text = " ".join(
+        m.get("content", "").lower()
+        for m in messages[-5:]
+        if m.get("role") in ("bot", "assistant")
+    )
+
+    # Simple topic markers: words the fan said that might be worth following up on
+    topic_keywords = [
+        "work", "job", "coding", "tired", "stressed", "busy", "traveling", "home",
+        "dog", "cat", "pet", "family", "sister", "brother", "mom", "dad",
+        "gym", "workout", "food", "eat", "hungry", "cooking",
+        "weekend", "vacation", "trip", "party", "friends",
+        "bed", "sleep", "morning", "night",
+        "music", "movie", "show", "book", "game",
+        "beer", "drink", "coffee", "wine",
+    ]
+
+    open_threads = []
+    seen_topics = set()
+
+    for msg in fan_history:
+        content = msg.get("content", "").lower()
+        for kw in topic_keywords:
+            if kw in content and kw not in seen_topics and kw not in recent_bot_text:
+                # Fan mentioned this topic, bot hasn't touched it in the last 5 bot msgs
+                snippet = content[:80].replace("\n", " ")
+                open_threads.append(f"He mentioned '{kw}' earlier: '{snippet}...' — you never followed up on this")
+                seen_topics.add(kw)
+                if len(open_threads) >= 3:
+                    return open_threads
+
+    return open_threads
+
+
+def _format_tier_content_awareness(sub: Subscriber, model_profile) -> str:
+    """
+    Tell the Director what's ACTUALLY IN each tier so she can sext toward real content,
+    not wave vaguely at "proceed with caution."
+
+    Uses TIER_CONFIG from engine/onboarding.py — canonical source.
+    """
+    try:
+        from onboarding import ContentTier, TIER_CONFIG
+    except Exception:
+        return ""
+
+    tier_order = [
+        ContentTier.TIER_1_BODY_TEASE,
+        ContentTier.TIER_2_TOP_TEASE,
+        ContentTier.TIER_3_TOP_REVEAL,
+        ContentTier.TIER_4_BOTTOM_REVEAL,
+        ContentTier.TIER_5_FULL_EXPLICIT,
+        ContentTier.TIER_6_CLIMAX,
+    ]
+
+    ppv_count = sub.spending.ppv_count if sub.spending else 0
+    current_tier_idx = min(ppv_count, 5)  # 0-indexed into tier_order
+
+    lines = [f"CURRENT TIER POSITION: {current_tier_idx + 1} of 6 (next drop = tier {min(current_tier_idx + 1, 6)})"]
+    lines.append("TIER CONTENT MAP (what's actually in each bundle):")
+    for i, tier in enumerate(tier_order):
+        cfg = TIER_CONFIG.get(tier, {})
+        marker = ">>> CURRENT" if i == current_tier_idx else ""
+        lines.append(
+            f"  T{i+1} ${cfg.get('price', 0):.2f} — {cfg.get('name', '')}: "
+            f"{cfg.get('description', '')} {marker}"
+        )
+    lines.append(
+        "Use this to sext toward the REAL content of the current/next tier — "
+        "not generic 'proceed with caution' vibes."
+    )
+    return "\n".join(lines)
 
 
 def _format_subscriber(sub: Subscriber) -> str:

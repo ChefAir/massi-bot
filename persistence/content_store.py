@@ -191,15 +191,16 @@ def get_model_catalog(model_id: str) -> Dict[int, List[Dict[str, Any]]]:
     return catalog
 
 
-def get_catalog_readiness(model_id: str) -> Dict[str, Any]:
+def get_catalog_readiness(model_id: str, active_tier_count: int = 6) -> Dict[str, Any]:
     """
     Check how many bundles are loaded per tier for a model.
     Useful for /readiness command in the admin bot.
+    Only checks tiers 1 through active_tier_count.
     """
     catalog = get_model_catalog(model_id)
     tiers = []
     ready = True
-    for tier_int in range(1, 7):
+    for tier_int in range(1, active_tier_count + 1):
         tier_enum = _int_to_tier(tier_int)
         bundles = catalog.get(tier_int, [])
         config = TIER_CONFIG[tier_enum] if tier_enum else {}

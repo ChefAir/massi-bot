@@ -1,373 +1,289 @@
-# Massi-Bot — AI-Powered Chatbot Engine for Creator Platforms
+# Massi-Bot — Single-Agent Chatbot for Creator Platforms
 
-An automated 24/7 chatting and selling system for Fanvue and OnlyFans. Runs 10 psychological avatar personas off a single model's content, using a 16-state conversation machine, 120 scripted conversation arcs, a 7-agent LLM pipeline, and a 6-tier pricing ladder ($27.38 - $200.00, total $561.20 per session).
+Automated 24/7 chatbot for Fanvue and OnlyFans creator accounts. Runs a single Opus 4.7 conversational agent per fan message, with Grok available as an uncensor tool the agent calls when its own output isn't explicit enough.
 
 ---
 
 ## What This Does
 
-- Automatically responds to every subscriber message on Fanvue and/or OnlyFans
-- Builds genuine rapport through the GFE (Girlfriend Experience) agent before selling
-- Guides subscribers through a 6-tier PPV selling pipeline with psychologically optimized scripts
-- Remembers subscriber details across conversations using RAG memory (pgvector)
-- Sends real-time admin alerts to your Telegram for whale detection, purchases, and errors
-- Costs ~$0.008 per message in LLM fees (~$0.08-0.12 per full session)
+- Responds automatically to every subscriber message on Fanvue and/or OnlyFans
+- Builds rapport, asks for consent, and runs a 6-tier PPV pipeline (or tiers 1-3 only, or GFE-only — your choice)
+- Remembers fans across conversations via pgvector RAG with an Ebbinghaus forgetting curve
+- Handles custom orders (detects specific requests, quotes prices from your WILLS_AND_WONTS.md, fires Telegram admin alerts for payment verification)
+- Sends real-time Telegram alerts for whales, purchases, and errors
+- LLM cost: one Opus 4.7 call per fan message (~$0.008-0.015), plus occasional Grok tool calls
 
-**Revenue potential**: 100 subscribers x $150 avg spend = **$15,000/month**
+Default tier pricing (you can change during setup):
+
+| Tier | Price | Content |
+|------|-------|---------|
+| 1 | $27.38 | Clothed body tease |
+| 2 | $36.56 | Lingerie / top tease |
+| 3 | $77.35 | Topless |
+| 4 | $92.46 | Bottoms off (pussy hidden) |
+| 5 | $127.45 | Fully nude, self-play |
+| 6 | $200.00 | Climax with toy |
+| Cont. | $20.00 | GFE continuation paywall (never NSFW) |
+
+Full session = $561.20.
 
 ---
 
-## How It Works
+## Architecture: Single Agent, Many Tools
 
-### The Selling Pipeline
-1. New subscriber arrives -> GFE Agent builds genuine rapport (no selling)
-2. After rapport metrics are met -> asks for sext consent
-3. If consent given -> enters the selling pipeline
-4. **Qualifying** -> learns about the subscriber (age, location, interests)
-5. **Warming** -> builds sexual tension through flirty conversation
-6. **PPV Drops** -> sends tier 1 ($27.38) through tier 6 ($200.00) with bridges between each
-7. **Post-Session** -> warm GFE conversation, no selling, relationship maintenance
-8. **Retention** -> re-engagement if subscriber goes quiet
+Every fan message goes through one pipeline:
 
-### The 7-Agent Pipeline
-Every message passes through 7 specialized AI agents:
-1. **Context Builder** — Assembles subscriber profile + RAG memories
-2. **Emotion Analyzer** — Scores engagement, buy readiness, mood
-3. **Sales Strategist** — Decides: qualify, warm, drop PPV, handle objection
-4. **Conversation Director** — Generates the actual response text
-5. **Uncensor Agent** — Adjusts explicitness to match the current tier
-6. **Quality Validator** — 17-check quality gate before sending
-7. **BotAction Builder** — Converts to platform API calls with realistic delays
+```
+webhook arrives
+  -> adaptive settle window (8s initial, +5s per new msg, 30s cap)
+  -> per-subscriber lock (burst messages merged into one text block)
+  -> context build (memories, relationship state, time gap, weather, session arc)
+  -> ONE OPUS 4.7 CALL with tool access
+         tools: uncensor (Grok), classify_custom, fire_admin_alert, get_memories
+  -> code-level post-processing:
+         8 parallel guardrails (Cresta pattern — zero added latency)
+         PPV heads-up injection + Cobalt-Strike jitter (108-252s)
+         state advancement, HV anti-repeat registry, bandit outcome recording
+         memory extraction
+  -> execute actions (send messages + PPVs to platform)
+  -> post-send queue drain
+```
 
-### GFE-Only Mode
-If you can't create NSFW content, the system runs in GFE-only mode:
-- Subscribers get a genuine girlfriend experience
-- Revenue comes from $20 continuation paywalls every ~30 messages
-- No tier content needed — just 20 clothed lifestyle photos for continuation
+**Why single-agent, not multi-agent?** Every conversational AI that works at scale (Character.AI, Replika, ChatGPT, Claude.ai, Inflection Pi) is single-model. Multi-agent pipelines fragment context and degrade conversation quality. Code enforces deterministic invariants; one LLM handles all the judgment.
 
 ---
 
 ## Prerequisites
 
-You need:
-
 | Account | Purpose | Cost |
 |---------|---------|------|
 | Google Cloud Platform | VM hosting | ~$25/mo (e2-medium) |
-| Supabase | Database + RAG memory | Free tier |
-| OpenRouter | LLM API calls | $5-20/mo |
-| Telegram | Admin bot interface | Free |
-| Domain name | SSL + webhook endpoints | ~$10/yr |
-| Fanvue Developer Account | OAuth + webhooks | Free (if using Fanvue) |
-| OnlyFansAPI.com | OF API access | Varies (if using OnlyFans) |
-| Sentry | Error tracking | Free tier (optional) |
-| Claude Code | Automated deployment | Requires Anthropic API key |
+| Supabase | Database + pgvector RAG | Free tier |
+| OpenRouter | Opus 4.7 + Grok | $50 credits to start |
+| Claude Pro/Max | To run Claude Code | $20+/mo |
+| Telegram | Admin bot | Free |
+| Domain name | SSL + webhooks | ~$10/yr |
+| Fanvue Developer Account | OAuth + webhooks | Free |
+| OnlyFansAPI.com | OF API access | Their pricing |
+| Sentry | Error tracking | Free (optional) |
 
-**Total startup cost**: ~$40-60 for the first month (domain + VM + LLM credits)
+Total startup cost: ~$40-60 for the first month.
 
----
-
-## Step 1: Create Your Google Cloud VM
-
-1. Go to [console.cloud.google.com](https://console.cloud.google.com)
-2. Create a new project (or use an existing one)
-3. Navigate to **Compute Engine** -> **VM Instances** -> **Create Instance**
-4. Configure:
-   - **Name**: `massi-bot` (or anything)
-   - **Region**: Choose one close to your subscribers
-   - **Machine type**: `e2-medium` (2 vCPU, 4 GB RAM)
-   - **Boot disk**: Ubuntu 22.04 LTS, 30 GB SSD
-   - **Firewall**: Check both "Allow HTTP traffic" and "Allow HTTPS traffic"
-5. Click **Create**
-
-### Set Up Firewall Rules
-
-1. Go to **VPC Network** -> **Firewall** -> **Create Firewall Rule**
-2. Create a rule:
-   - **Name**: `allow-http-https`
-   - **Direction**: Ingress
-   - **Targets**: All instances in the network
-   - **Source IP ranges**: `0.0.0.0/0`
-   - **Protocols and ports**: TCP: `80,443`
-3. Click **Create**
-
-### SSH Into Your VM
-
-1. Go back to **Compute Engine** -> **VM Instances**
-2. Find your instance and click the **SSH** button
-3. A browser window will open — click **Authorize** when prompted
-4. You're now inside your VM terminal
+**About OpenRouter credits:** One Opus 4.7 call per fan message. Typical burn is ~$0.008-0.015 per message. $50 covers thousands of messages. Watch `https://openrouter.ai/activity` for usage. Top up before you hit zero — otherwise the bot goes silent.
 
 ---
 
-## Step 2: Install Claude Code
+## Quick Start
 
-Run these commands in your VM terminal:
+### 1. Create a GCP VM
+
+- Go to [console.cloud.google.com](https://console.cloud.google.com)
+- Compute Engine -> VM Instances -> Create Instance
+- Machine type: `e2-medium` (2 vCPU, 4 GB RAM)
+- Boot disk: Ubuntu 22.04 LTS, 30 GB SSD
+- Firewall: Allow HTTP + HTTPS
+- Add a firewall rule for TCP 80,443 from `0.0.0.0/0`
+
+### 2. Install Claude Code
+
+SSH into the VM (click the SSH button on GCP console), then:
 
 ```bash
-# Install Node.js 20
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
-
-# Install Claude Code
 sudo npm install -g @anthropic-ai/claude-code
 
-# Set your Anthropic API key
 export ANTHROPIC_API_KEY="sk-ant-your-key-here"
-
-# Add to bashrc so it persists
 echo 'export ANTHROPIC_API_KEY="sk-ant-your-key-here"' >> ~/.bashrc
 ```
 
----
-
-## Step 3: Clone and Deploy
+### 3. Clone and Launch
 
 ```bash
-# Clone the repository
 git clone https://github.com/ChefAir/massi-bot.git
 cd massi-bot
-
-# Start Claude Code — it will guide you through everything
 claude --dangerously-skip-permissions
 ```
 
-Claude Code reads the `CLAUDE.md` file and automatically:
-1. Asks which platform(s) you want to use (Fanvue, OnlyFans, or both)
-2. Lists all accounts you need to create with cost estimates
-3. Walks you through each credential one at a time
-4. Deploys the Supabase database schema
-5. Installs Docker, nginx, and SSL certificates
-6. Builds and starts all services
-7. Guides you through webhook registration
-8. Helps with content ingestion
+Claude Code reads `CLAUDE.md` and will:
+
+1. Ask which platform(s) you're using
+2. Ask about your NSFW capability (full tiers 1-6, tiers 1-3 only, or GFE-only)
+3. Show you the default tier prices and ask if you want to keep or change them
+4. Ask you for your model's hard limits, soft limits, and custom pricing (writes `WILLS_AND_WONTS.md`)
+5. Walk you through each account and credential one at a time
+6. Paste each of the 10 database migrations into Supabase one at a time
+7. Install Docker, nginx, SSL
+8. Build + start containers
+9. Register webhooks
+10. Guide you through content upload and ingestion
+11. Walk you through testing with a spare account
 
 **You don't need to know how to code.** Claude Code handles everything.
 
 ---
 
-## Step 4: Session Management (IMPORTANT)
+## Testing the System
 
-### Exiting a Session
-- Press **Ctrl+C twice** to exit Claude Code
-- Claude will show a resume command like:
-  ```
-  claude --resume "abc123-def456-..."
-  ```
-- **Copy this command immediately**
-- Save it to a text file on your LOCAL computer (not the VM)
+Before you point real subscribers at it:
 
-### Resuming a Session
-1. SSH back into your VM (click SSH button on GCP console)
-2. Navigate to the project: `cd massi-bot`
-3. Paste your resume command and add the permissions flag:
-   ```bash
-   claude --resume "abc123-def456-..." --dangerously-skip-permissions
-   ```
+1. **Open a spare account** on Fanvue or OnlyFans (not your model's account).
+2. **Send yourself a free subscription link** from the model's account to the spare.
+3. **Chat with the bot** from the spare account. It'll respond in 15-30 seconds.
+4. **When a PPV arrives, do NOT buy it.** Instead, tell Claude Code: "**simulate PPV purchase for tier 1**". Claude fires the purchase webhook against your local instance, which advances state exactly as a real purchase would — the bot reacts, then queues the next tier's drop.
+5. **Keep Claude Code running** during testing. Real purchases work through the actual webhook; simulated ones need Claude to fire them.
 
-### WARNING: Don't Leave Sessions Idle
-
-**Do NOT leave Claude Code running idle for hours with the VM SSH window open.** The GCP SSH session will eventually disconnect (typically after 30-60 minutes of inactivity), and you will lose access to that Claude Code session.
-
-**Always:**
-- Properly exit with Ctrl+C twice when you're done
-- Save your resume ID to a local text file
-- Resume when you're ready to continue working
+See the "Step 7: Testing" section of `CLAUDE.md` for full details.
 
 ---
 
-## Step 5: Content Setup
+## Session Management
 
-### Create Content Folders
+- Press **Ctrl+C twice** to exit Claude Code.
+- Claude prints a resume command: `claude --resume "SESSION_ID"`.
+- **Save this to a text file on your local machine.**
+- To resume: SSH back in, `cd massi-bot`, then:
+  ```bash
+  claude --resume "SESSION_ID" --dangerously-skip-permissions
+  ```
 
-On your Fanvue/OnlyFans platform, create these folders (vaults/collections):
+Do not leave Claude Code idle. GCP SSH disconnects after 30-60 minutes of inactivity and you'll lose the session.
+
+---
+
+## Content Upload
+
+On your Fanvue/OnlyFans platform, create these folders:
 
 ```
-tier1session1/    — 3-4 images + 1-2 videos
-tier2session1/    — 3-4 images + 1-2 videos
-tier3session1/    — 3-4 images + 1-2 videos
-tier4session1/    — 3-4 images + 1-2 videos
-tier5session1/    — 3-4 images + 1-2 videos  (skip if GFE-only or T1-T4 mode)
-tier6session1/    — 3-4 images + 1-2 videos  (skip if GFE-only or T1-T4 mode)
-continuation/     — ~20 images (NEVER NSFW)
+tier1session1/    3-4 images + 1-2 videos (clothed body tease)
+tier2session1/    3-4 images + 1-2 videos (lingerie / top tease)
+tier3session1/    3-4 images + 1-2 videos (topless)
+tier4session1/    3-4 images + 1-2 videos (bottoms off, pussy hidden)  [Full tiers only]
+tier5session1/    3-4 images + 1-2 videos (fully nude, self-play)       [Full tiers only]
+tier6session1/    3-4 images + 1-2 videos (climax with toy)             [Full tiers only]
+continuation/     ~20 images (NEVER NSFW — clothed lifestyle)
 ```
-
-### What Goes in Each Tier
-
-| Tier | Price | Content | Examples |
-|------|-------|---------|----------|
-| 1 | $27.38 | **Clothed body tease** | Fitted outfit, flirty pose, showing curves through clothes |
-| 2 | $36.56 | **Lingerie / underwear** | Bra peeking, cleavage, lace |
-| 3 | $77.35 | **Topless** | Bare breasts, sensual positioning |
-| 4 | $92.46 | **Bottoms off** | Full nude, artistic, no toys |
-| 5 | $127.45 | **Self-play** | Fingering, intimate touching |
-| 6 | $200.00 | **Climax** | Toys, riding, everything shown |
-| Cont. | $20.00 | **Clothed lifestyle** | Selfies, GRWM, casual (NEVER NSFW) |
-
-**Total per full session: $561.20**
 
 ### Critical Content Rules
 
-1. **Each tier within a session must look like one continuous moment.** Same background, same hairstyle, same outfit progression. The subscriber should believe the model is undressing for them in real time.
+1. **Each tier within a session must look like one continuous moment** — same background, hair, outfit progression. It simulates real-time undressing.
+2. **Continuation content is NEVER NSFW** — clothed, casual, lifestyle. This is the $20 GFE paywall content.
+3. **Never show skin or nudity for free.** Not on Instagram, not on the subscriber wall, not anywhere except behind the paid tier pipeline. Scarcity is what makes $27-$200 per tier work.
 
-2. **Continuation content is NEVER NSFW.** Clothed selfies, lifestyle, mirror shots. This is the GFE paywall content — it's about connection, not nudity.
+### Register Content
 
-3. **Never show skin or nudity for free.** Not on Instagram, not on the subscriber wall, not in any free post. The ONLY place subscribers see NSFW content is when they pay for it in the tier pipeline. This scarcity is what allows you to charge $27-$200 per tier.
+After uploading, tell Claude Code: "I've uploaded my tier content. Please register it."
 
-### After Uploading
-
-Once content is on the platform, tell Claude Code:
-
-> "I've uploaded my content to the tier folders on Fanvue/OnlyFans. Please help me register it in the chatbot system."
-
-Claude Code will use `setup/ingest_content.py` to pull the media IDs and register them in the content catalog.
+Claude runs `setup/ingest_content.py` to pull media IDs and write them to the `content_catalog` table.
 
 ---
 
-## For Synthetic AI Models / GFE-Only Mode
+## Tier Modes
 
-If you're running a fully synthetic AI character OR cannot create NSFW content:
+### Full Pipeline (tiers 1-6)
 
-### Option A: GFE-Only Mode
-- Tell Claude Code: "Set up GFE-only mode"
-- The selling pipeline is completely disabled
-- Subscribers get a genuine girlfriend experience conversation
-- Revenue: $20 paywall every ~30 messages
-- You only need the `continuation/` folder (20 clothed images)
-- Less revenue per subscriber, but still monetizes every conversation
+You can produce explicit NSFW content including masturbation (tier 5) and climax with toy (tier 6). Maximum revenue per session.
 
-### Option B: Tiers 1-4 Only
-- Tell Claude Code: "Set up tiers 1-4 only, skip 5 and 6"
-- The system sells through tier 4 (full nude) but stops before explicit content
-- Revenue potential: $233.67 per session (tiers 1-4)
-- You skip tiers 5-6 which require masturbation/toy content
+### Tease Only (tiers 1-3)
 
-### Option C: Full Pipeline (Tiers 1-6)
-- Requires the ability to create explicit AI-generated images and videos
-- Tiers 5-6 involve self-play, toy use, and climax content
-- This is a **specialized skill** — don't attempt without experience
+You can do clothed -> lingerie -> topless but no explicit content. Set `active_tier_count: 3` in the model profile. Revenue per session: ~$141.
 
-> **IMPORTANT**: If you cannot create NSFW AI-generated content, that's perfectly fine. GFE-only mode and tiers 1-4 are both viable business models. Just be honest with Claude Code about your content capabilities during setup.
+### GFE-Only Mode
 
----
-
-## Making Changes to the System
-
-All modifications are done through Claude Code:
-
-1. SSH into your VM
-2. Navigate to the project: `cd massi-bot`
-3. Start Claude Code: `claude --dangerously-skip-permissions` (or resume a session)
-4. Tell Claude what you want to change
-
-### Best Practices
-
-- **Have Claude analyze ALL project files** at the start of every new session. This gives it full context.
-- **Have Claude do web research** for every new idea before implementing it
-- **Have Claude create a research doc and implementation manual** under `docs/` BEFORE making any code changes
-- This ensures everything is documented, and if your VM disconnects unexpectedly, a new Claude Code session can read the docs and pick up exactly where the last one left off
-
-### Example Requests
-
-- "Modify the pricing to use different tier amounts"
-- "Add a new avatar persona for my model's personality"
-- "Change the GFE rapport threshold from 15 messages to 25"
-- "Add Spanish language support to the bot responses"
-- "Show me the conversion rate for each tier"
-
----
-
-## 1-on-1 Setup Service
-
-Don't want to go through setup yourself? I offer a **5-day hands-on setup** where I'll:
-
-- Configure your entire VM and chatbot system
-- Set up all accounts and integrations
-- Register your content in the catalog
-- Test everything end-to-end
-- Train you on monitoring and making changes
-
-By the end of 5 days, you'll have a fully functional chatbot system processing messages 24/7.
-
-### DISCLAIMER
-
-> **This product involves adult content platforms.** The chatbot system automates conversations that may include NSFW content delivery. The 1-on-1 setup covers the **chatbot system only** — I will NOT help create NSFW AI-generated content. That is your responsibility.
->
-> **If you cannot create NSFW content**, you can still use GFE-only mode or tiers 1-4. But do NOT purchase the 1-on-1 expecting help with explicit content generation.
-
-**Book your session**: [chattinghelp.massimosintra.com](https://chattinghelp.massimosintra.com)
+You cannot produce NSFW content at all. Tell Claude Code: "Set up GFE-only mode". The selling pipeline is bypassed entirely. Revenue: $20 every ~30 messages via continuation paywall. Only the `continuation/` folder is needed.
 
 ---
 
 ## Troubleshooting
 
-### Docker containers won't start
+**Docker containers won't start**
 ```bash
 docker compose logs --tail=50
-# Check for missing env vars or port conflicts
 ```
 
-### Webhooks not working
+**Webhooks failing**
 ```bash
 bash setup/test_webhooks.sh
-# Should show HTTP 401/403 (signature verification working)
-# If HTTP 502/504: containers not running
-# If connection refused: nginx not configured or SSL missing
+# Expected: HTTP 401/403 (HMAC rejecting unsigned requests = good)
+# HTTP 502/504: containers not running
+# Connection refused: nginx or SSL misconfigured
 ```
 
-### Fanvue OAuth fails
-- Verify redirect URI matches EXACTLY: `https://{DOMAIN}/oauth/callback`
-- Check that all scopes are enabled in the Fanvue developer dashboard
-- Verify SSL certificate is valid: `curl -I https://{DOMAIN}/health/fanvue`
+**Fanvue OAuth fails**
+- Redirect URI must EXACTLY match `https://{DOMAIN}/oauth/callback`
+- All scopes must be enabled in the Fanvue dashboard
+- `curl -I https://{DOMAIN}/health/fanvue` should return 200
 
-### Bot not responding on Telegram
+**Telegram bot not responding**
 ```bash
 docker compose logs admin_bot --tail=20
-# Check TELEGRAM_BOT_TOKEN is correct
-# Verify TELEGRAM_ADMIN_IDS contains your user ID
 ```
+Check `TELEGRAM_BOT_TOKEN` and that `TELEGRAM_ADMIN_IDS` contains your numeric user ID.
 
-### LLM responses failing
+**LLM errors**
 ```bash
-docker compose logs fanvue --tail=50 | grep -i "openrouter\|llm\|error"
-# Check OPENROUTER_API_KEY has credits remaining
-# Visit https://openrouter.ai/activity to see usage
+docker compose logs fanvue --tail=50 | grep -i "openrouter\|error"
 ```
+Check OpenRouter credits at `https://openrouter.ai/activity`.
 
-### Messages not sending to subscribers
-- Check that `content_catalog` has entries: Send `/readiness` to the Telegram bot
-- Verify the engine isn't paused: Send `/resume` to the Telegram bot
-- Check for HMAC signature errors in connector logs
+**Bot won't send PPVs**
+- Send `/readiness` on Telegram — all tiers must show content
+- Send `/resume` on Telegram — engine must be unpaused
+- Check connector logs for HMAC errors
 
 ---
 
-## Project Structure
+## Project Layout
 
 ```
 massi-bot/
-├── CLAUDE.md              — Claude Code deployment orchestrator
-├── README.md              — This file
-├── .env.template          — Environment variable template
-├── docker-compose.yml     — Docker service orchestration
-├── Dockerfile.*           — Container build files
-├── requirements.txt       — Python dependencies
+├── CLAUDE.md                  Claude Code deployment orchestrator
+├── README.md                  This file
+├── .env.template              Environment variable template
+├── docker-compose.yml         Service orchestration
+├── Dockerfile.*               Container build files
+├── requirements.txt           Python dependencies
 │
-├── engine/                — Core conversation state machine (16 states, 10 avatars)
-├── agents/                — 7-agent LLM pipeline (orchestrator, strategist, director...)
-├── connector/             — Platform connectors (Fanvue OAuth, OnlyFans API)
-├── persistence/           — Supabase CRUD (subscribers, content catalog, model profiles)
-├── llm/                   — LLM client, prompts, guardrails, RAG memory
-├── admin_bot/             — Telegram admin bot (stats, revenue, content intake)
+├── engine/                    Subscriber model, avatars, onboarding, state
+│   ├── models.py                  Subscriber dataclass (+ new fields for single-agent)
+│   ├── text_filters.py            Deterministic invariant enforcement
+│   ├── high_value_memory.py       Anti-repetition registry (15 categories)
+│   ├── custom_orders.py           Custom request detection + state machine
+│   ├── bandit_recorder.py         Silent outcome capture (Thompson Sampling prep)
+│   └── ...
 │
-├── migrations/            — Supabase SQL schema files
-├── config/                — Nginx template
-├── setup/                 — Deployment helper scripts
-├── tests/                 — Test suite (pytest)
-└── docs/                  — Architecture and implementation documentation
+├── agents/                    Single-agent system
+│   ├── single_agent.py            One Opus 4.7 call per message + tools
+│   ├── orchestrator.py            Thin wrapper called by connectors
+│   ├── context_builder.py         Pre-LLM context assembly (pure code)
+│   ├── parallel_guardrails.py     8 concurrent safety classifiers
+│   ├── uncensor_agent.py          Grok (tool called by single agent)
+│   └── media_reactor.py           Media-specific reactions
+│
+├── connector/                 Platform I/O
+│   ├── fanvue_connector.py        FastAPI app, Fanvue webhooks, OAuth
+│   ├── of_connector.py            FastAPI app, OF webhooks
+│   ├── ppv_cleanup.py             6-hour auto-delete sweep for unpaid PPVs
+│   └── ...
+│
+├── llm/                       LLM + memory infrastructure
+│   ├── memory_store.py            pgvector RAG
+│   ├── memory_manager.py          Memory orchestration
+│   ├── memory_extractor.py        Fact extraction
+│   ├── prompt_cache.py            Anthropic prompt caching (90% discount)
+│   └── context_awareness.py       Weather + time of day
+│
+├── persistence/               Supabase CRUD
+├── admin_bot/                 Telegram admin commands (/stats, /pause, etc.)
+├── migrations/                10 SQL migrations — paste one at a time
+├── setup/                     Helper scripts (schema deploy, ingest, webhook test)
+├── tests/                     pytest suite
+└── docs/                      Setup log + design notes (session-scoped)
 ```
 
 ---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details. You have full commercial rights to use, modify, and distribute this software.
+MIT. See [LICENSE](LICENSE). Full commercial rights to use, modify, and distribute.

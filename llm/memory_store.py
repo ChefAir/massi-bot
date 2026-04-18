@@ -83,7 +83,7 @@ logger = logging.getLogger(__name__)
 
 def _is_sim_mode() -> bool:
     """Return True if running in simulation mode (no DB writes)."""
-    return os.environ.get("MASSI_BOT_SIM_MODE", "").lower() in ("true", "1", "yes")
+    return os.environ.get("UNITYLINK_SIM_MODE", "").lower() in ("true", "1", "yes")
 
 
 # ─────────────────────────────────────────────
@@ -95,12 +95,12 @@ _encoder = None
 _supabase = None
 
 
-_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
+_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 _EMBEDDING_DIM = 1024 if "bge-m3" in _EMBEDDING_MODEL else 384
 
 
 def _get_encoder():
-    """Lazy-load the sentence-transformer model. Defaults to BGE-M3 (1024-dim)."""
+    """Lazy-load the sentence-transformer model. Configurable via EMBEDDING_MODEL env var."""
     global _encoder
     if _encoder is None:
         try:
@@ -138,7 +138,7 @@ def prewarm_encoder():
 
 
 def _embed(text: str) -> Optional[list[float]]:
-    """Generate an embedding for the given text (dimension depends on model)."""
+    """Generate a 384-dim embedding for the given text."""
     enc = _get_encoder()
     if enc is None:
         return None
@@ -151,7 +151,7 @@ def _embed(text: str) -> Optional[list[float]]:
 
 
 def _embed_batch(texts: list[str]) -> list[Optional[list[float]]]:
-    """Generate embeddings for multiple texts in one batch call."""
+    """Generate 384-dim embeddings for multiple texts in one batch call."""
     enc = _get_encoder()
     if enc is None:
         return [None] * len(texts)
