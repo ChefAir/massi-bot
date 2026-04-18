@@ -399,32 +399,57 @@ When you run Claude Code in your existing repo to start the migration, **Claude 
 
 **Your fan messages, memories, subscribers, spending history, and transactions do not need to be exported or re-imported.** The new system reads from the same Supabase tables the old system wrote to. The moment you flip the switch, the new agent already knows everything about every fan — because all the relationship data lives in Supabase, and both versions share the same schema.
 
-### The migration flow
+### Where to clone the new repo (do NOT clone on top of your existing repo)
 
-In your existing repo on your VM, run:
+Your existing repo — the one currently running your multi-agent bot in production — stays exactly where it is. Do **not** clone the new massi-bot repo into it. Do **not** overwrite any of your files by cloning on top of them.
+
+The correct layout is:
+
+```
+~/massi-bot/              ← your EXISTING repo (untouched, production-live)
+~/massi-bot-new/          ← the NEW reference repo you clone fresh, as a sibling
+```
+
+SSH into your VM and run:
 
 ```bash
-cd ~/massi-bot      # or wherever your repo lives
+cd ~
+git clone https://github.com/ChefAir/massi-bot.git massi-bot-new
+```
+
+This creates `~/massi-bot-new/` as a **separate sibling directory**. Your existing `~/massi-bot/` (or whatever you named it) is not touched.
+
+### The migration flow
+
+Change into your **existing** repo (not the newly cloned one) and start Claude Code:
+
+```bash
+cd ~/massi-bot            # your EXISTING repo — where your bot actually runs
 claude --dangerously-skip-permissions
 ```
 
-Tell Claude: **"I want to upgrade to the single-agent system. Read through my entire project and propose a migration plan. Do NOT modify, move, or delete any of my existing files in this scan — read-only."**
+Tell Claude:
+
+> I want to upgrade to the single-agent system. The new reference repo is cloned at `~/massi-bot-new`. Read through my entire project here and the reference repo there, and propose a migration plan. Do NOT modify, move, or delete any of my existing files in this scan — read-only until I approve the plan.
 
 Claude will:
 
-1. **Scan your repo read-only** — no writes, no edits, no deletes.
-2. **Check which Supabase migrations you've applied** — most existing users are still on the v1.0 schema and have not run 001–008.
-3. **Write a `docs/migration_plan.md`** describing exactly which files it will add, which it will copy for backup, and which it will need to edit (typically just `agents/orchestrator.py` — to add the feature-flag router). You approve the plan before any file is modified.
-4. **Apply the plan only after your approval.**
-5. **Walk you through the Supabase migrations** (see next section — they're required).
-6. **Re-embed your existing RAG memories** to the new vector dimensions (see "Embedding dimension change" below).
-7. **Leave `USE_SINGLE_AGENT=false` as the default** so nothing changes in production until you say so.
+1. **Scan your existing repo read-only** — no writes, no edits, no deletes.
+2. **Read the reference repo at `~/massi-bot-new`** to know which new files need to be added.
+3. **Check which Supabase migrations you've applied** — most existing users are still on the v1.0 schema and have not run 001–008.
+4. **Write a `docs/migration_plan.md` inside your existing repo** describing exactly which new files it will copy in from `~/massi-bot-new`, which existing files it will back up (specifically `agents/orchestrator.py` → `agents/orchestrator_multi_agent.py`), and which existing files it will need to edit (typically just the orchestrator — to add the feature-flag router). You approve the plan before any file is touched.
+5. **Apply the plan only after your approval.** File copies go FROM `~/massi-bot-new/` INTO your existing repo. Originals in `~/massi-bot-new/` stay unchanged; it's just a read-source.
+6. **Walk you through the Supabase migrations** (see next section — they're required).
+7. **Re-embed your existing RAG memories** when you're ready to fully commit (see "Embedding dimension change" below — this is a one-way door, so timing matters).
+8. **Leave `USE_SINGLE_AGENT=false` as the default** so nothing changes in production until you say so.
+
+You can delete `~/massi-bot-new/` at any point after the migration is complete — it's just a reference. Your existing repo now contains everything it needs.
 
 ### Required Supabase migrations (existing users have NOT run these)
 
-The single-agent system depends on schema additions that most existing users haven't applied. These are **safe to run before flipping the switch** — they only add columns and tables; nothing is dropped, renamed, or destructive. The old multi-agent code will ignore the new columns.
+The single-agent system depends on schema additions most existing users haven't applied. There are two groups, and the distinction matters:
 
-In order:
+**Group A — safe, additive, backwards-compatible (apply these any time):**
 
 ```
 migrations/001_model_profile_columns.sql
@@ -435,26 +460,66 @@ migrations/005_memory_cleanup_and_index.sql
 migrations/006_ebbinghaus_forgetting.sql
 migrations/006_high_value_utterances.sql
 migrations/007_template_rewards.sql
+```
+
+These only add new columns, tables, and indexes. Nothing existing is dropped, renamed, or altered. The old multi-agent code will ignore the new schema additions. **Safe to run while the multi-agent system is live in production.**
+
+**Group B — destructive schema change (apply only at cutover time):**
+
+```
 migrations/008_bge_m3_embeddings.sql
 ```
 
-Claude pastes each one into your Supabase SQL Editor one at a time. If any fails with `relation already exists`, that's fine — you've already run that one; skip and continue.
+This one **alters the type of the `embedding` column** on `subscriber_memory` and `persona_memory` from `vector(384)` to `vector(1024)`. Your existing MiniLM embeddings become unusable by the multi-agent code after this runs. This is a **one-way door** — see the next section for how to time it.
 
-### Embedding dimension change (important)
+### How Claude actually delivers the SQL
 
-Migration 008 switches the embedding model from the older MiniLM (384-dim) to BAAI/bge-m3 (1024-dim). This is a massive retrieval-quality upgrade but it means your existing memories are encoded at the wrong dimension for the new model.
+Claude Code runs in your terminal on the VM. **It cannot reach into Supabase's web UI.** What actually happens for each migration file is:
 
-**What this means practically:** until you re-embed, the single agent's memory retrieval queries will silently return nothing — the vectors don't match. Your fan memories are not lost; they just need to be re-encoded.
+1. Claude reads the migration file from disk on the VM.
+2. Claude prints the full SQL into the chat so you can see it.
+3. **You** copy the SQL from the chat, open your Supabase dashboard in a browser → **SQL Editor → New query**, paste, and click **Run**.
+4. You tell Claude whether it succeeded or what error came back.
+5. If the error is `relation ... already exists` or `column ... already exists`, you've already applied that migration — skip it and tell Claude to move to the next one.
+6. Any other error: Claude diagnoses before moving on.
 
-Fix: after applying migration 008, run:
+Claude paces you through all 8 migration files this way, one at a time.
 
-```bash
-python3 setup/reembed_memories.py
-```
+### Embedding dimension change — the one-way door (read carefully)
 
-This reads every existing memory in `subscriber_memory` and `persona_memory`, re-encodes it with BGE-M3, and updates the embedding column. It processes in batches with a progress bar. Expect 5–15 minutes depending on how many memories you've accumulated. **Your message content, conversation history, fan state, and spending history are not touched — only the vector embeddings are regenerated.**
+Migration 008 changes the `embedding` column type from `vector(384)` (MiniLM) to `vector(1024)` (BGE-M3). This is a ~15-point retrieval-quality jump on MTEB benchmarks, but it is **destructive and irreversible**:
 
-**Do this before flipping `USE_SINGLE_AGENT=true`**, or the new agent will feel amnesiac for the first conversation with each fan.
+- **Before migration 008**: existing memories are 384-dim MiniLM vectors. The old multi-agent code queries with 384-dim — works. The single agent queries with 1024-dim — fails with a dimension mismatch.
+- **After migration 008 + re-embed**: memories are 1024-dim BGE-M3 vectors. The single agent — works. The old multi-agent code — its 384-dim queries no longer match the stored vectors. Memory retrieval will silently return nothing.
+
+This means you **cannot run both systems in parallel with full memory quality after migration 008.** The schema flip is a commit point. Plan for it.
+
+### The honest migration path (two phases, safe rollback until phase 2)
+
+**Phase 1 — apply additive migrations, test in parallel (multi-agent still fully functional):**
+
+1. Apply migrations 001–007 (Group A above). Multi-agent keeps running, untouched. New schema additions are ignored by the old code.
+2. Claude backs up your `agents/orchestrator.py` to `agents/orchestrator_multi_agent.py` and installs the feature-flag router.
+3. `USE_SINGLE_AGENT=false` in `.env` → production is unchanged.
+4. Optionally, set `EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2` in `.env` to keep the single agent on MiniLM too. Flip `USE_SINGLE_AGENT=true` on a test subscriber only. This validates the **conversation quality** of the single agent end-to-end without touching your vector store. The single agent reads memories at MiniLM quality — same as your old system today. This is a reversible test: flip the flag back to `false` at any time and your multi-agent setup is untouched.
+5. Validate on the test fan for as long as you want. Days, weeks, whatever makes you comfortable. No deadline.
+
+**Phase 2 — the cutover (commit point, not reversible without restoring from backup):**
+
+When you're satisfied with the single agent's conversation quality and ready to upgrade to BGE-M3:
+
+1. Pause the engine via the Telegram bot: `/pause`. Fans who message during the window will be handled when you resume.
+2. Take a Supabase backup. Seriously — if anything goes wrong, you want a restore point.
+3. Apply migration 008 in the Supabase SQL Editor. The column type changes; existing embedding values become unusable.
+4. Run `python3 setup/reembed_memories.py` on the VM. This reads every row in `subscriber_memory` and `persona_memory`, re-encodes the `fact` / content text with BGE-M3, and writes the new 1024-dim vector. **Your message content, conversation history, subscriber state, spending history, and transactions are not touched — only the vector column is regenerated.** Expect 5–30 minutes depending on memory count.
+5. Remove `EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2` from `.env` (or change it to `EMBEDDING_MODEL=BAAI/bge-m3`).
+6. Set `USE_SINGLE_AGENT=true` globally.
+7. `docker compose restart`.
+8. Unpause the engine: `/resume`.
+
+Total Phase 2 downtime: 15–45 minutes depending on your memory count and how fast your re-embed runs. During that window the bot is silently queuing messages behind the pause flag; they'll be handled as soon as you resume.
+
+**Rollback after Phase 2:** the old multi-agent code will still run (the feature flag routes to it), but its memory retrieval will return nothing because the vectors in the database no longer match its 384-dim model. The bot will reply coherently to individual messages but with no memory of past conversations. If that's an acceptable rollback state for you, fine. If not, restore from the Supabase backup you took in step 2 and set `USE_SINGLE_AGENT=false`. That's why step 2 is not optional.
 
 ### Your customizations are preserved
 
@@ -465,18 +530,6 @@ If you've customized:
 - Your Supabase content catalog
 
 ...**all of it carries over.** The single agent reads the same avatar configs, the same WILLS_AND_WONTS files, the same env vars, and the same content catalog. Nothing needs to be re-done.
-
-### The step-by-step testing plan
-
-Once Claude has added the new files and you've run the migrations + re-embed:
-
-1. **Keep `USE_SINGLE_AGENT=false` in production.** Nothing changes. Multi-agent keeps running.
-2. **Spin up a test subscriber** on a spare Fanvue/OnlyFans account (as described in [Testing the System](#testing-the-system)).
-3. **Set `USE_SINGLE_AGENT=true` only for your test subscriber** — either via a whitelist env var or by running a second instance just for the test fan.
-4. **Chat with the test fan for a while.** Go through consent, a couple tiers, a continuation paywall, maybe a custom request. Use your judgment — does it feel better than the multi-agent version? Are the responses in-character? Is the cost lower in your OpenRouter dashboard?
-5. **When confident, flip `USE_SINGLE_AGENT=true` globally.** Restart containers. The new agent is now handling all fan traffic.
-6. **Monitor `/stats` and OpenRouter burn rate for 24–48 hours.** If anything looks wrong, flip back to `false` and restart. Zero drama rollback.
-7. **Delete the old multi-agent files only when you're 100% sure you don't need them.** Or never. They sit in `agents/orchestrator_multi_agent.py` + the other old agent files costing you nothing.
 
 ### Why this matters enough to do it
 
