@@ -165,6 +165,11 @@ async def _execute_tool(
     elif tool_name == "classify_custom_request":
         request_text = args.get("request_text", "")
         custom_type, price = classify_custom_type(request_text)
+        # Auto-create pending_custom_order so the purchase webhook can detect the
+        # custom payment and route it as content_type="custom" (not "ppv").
+        # Without this, the payment would increment ppv_count and skip tier 1.
+        platform = getattr(sub, "_platform", "") or ""
+        sub.pending_custom_order = new_order(request_text, custom_type, price, platform=platform)
         return json.dumps({"custom_type": custom_type, "price": price, "price_formatted": f"${price:.2f}"})
 
     elif tool_name == "fire_custom_payment_alert":
@@ -362,6 +367,13 @@ Next tier if dropping PPV: tier {next_tier}
 GFE messages so far: {gfe_msgs}
 Time since his last message: {gap_str}
 Goodbye signal: {gs.get('is_goodbye', False)} | Return signal: {gs.get('is_return', False)}
+
+TIME GAP RESPONSE RULES (MANDATORY — match your energy to the ACTUAL gap):
+  Under 30 min: NO acknowledgment of any gap. Continue naturally as if no time passed.
+  30 min to 4 hours: Casual only. "hey" / "there you are". NO dramatic re-entry. NO "where have you been" / "look who's back" / "finally" / "I was wondering". It's been a few hours, not a lifetime.
+  4 to 24 hours: Warm return. "missed you" energy is OK. Still no overdramatic "look who decided to show up."
+  Over 24 hours: Full re-engagement energy. "look who's back" is appropriate here and ONLY here.
+  CRITICAL: Read the actual gap value above. If it says "3 hours" do NOT respond as if it's been weeks. Calibrate precisely.
 {pending_ppv_block}{pending_custom_block}{recovery_block}
 
 # RELATIONSHIP STATE
@@ -389,7 +401,9 @@ Goodbye signal: {gs.get('is_goodbye', False)} | Return signal: {gs.get('is_retur
    Your job: write the lead-in message + a vague caption (no body parts/clothing/actions in caption).
 
 3. PITCH A CUSTOM — if the fan asks for something SPECIFIC (outfit, scenario, custom video/pic):
-   Call the classify_custom_request tool to get the price, then quote it to the fan.
+   You MUST call the classify_custom_request tool before quoting any price. Do NOT quote from memory.
+   The tool creates payment tracking on the backend — without the call, the fan's payment will be
+   miscategorized as a tier PPV and the whole custom flow breaks. Tool first, quote second.
 
 4. VERIFY CUSTOM PAYMENT — if you pitched a custom AND the fan claims they paid:
    Call fire_custom_payment_alert to notify the admin.
@@ -435,6 +449,7 @@ NEVER pushback on his interest. If he wants to escalate, let him — just make s
 16. If pending PPV exists, do NOT drop another. Reference existing one.
 17. NEVER pushback on fan's sexual escalation. Match or lead higher.
 18. CUSTOM PAYMENTS: customs are paid via PPV unlock. You send a PPV at the custom price — the fan unlocks it as payment. When fan asks how to pay, tell them you'll send a payment PPV for them to unlock and that they'll receive the custom DELIVERED within 48 hours of payment. ALWAYS mention "delivered within 48 hours" when discussing customs. Never say "start filming" — say "deliver." Then include a ppv block in your output with tier="custom" and the quoted price.
+19. CUSTOM VIDEO LENGTH: custom videos are 1-2 minutes. NEVER promise longer than 2.5 minutes. If asked about length, say "about a minute or two" or "around 90 seconds." Do NOT say 5, 6, 7+ minutes — that's unrealistic and creates a huge file.
 
 {hv_block}
 {anti_repeat_block}
@@ -448,7 +463,7 @@ NEVER pushback on his interest. If he wants to escalate, let him — just make s
   "ppv": null
 }}
 
-When dropping a PPV:
+When dropping a TIER PPV (tier 1-6):
 {{
   "messages": [{{"text": "lead-in", "delay_seconds": 8}}],
   "ppv": {{
@@ -458,6 +473,18 @@ When dropping a PPV:
   }},
   "consent_given": true
 }}
+
+When sending a CUSTOM payment PPV (after calling classify_custom_request):
+{{
+  "messages": [{{"text": "ok babe, here's the payment for your custom... delivered within 48 hours once you unlock", "delay_seconds": 5}}],
+  "ppv": {{
+    "tier": "custom",
+    "price": 177.38,
+    "caption": "unlock to confirm your custom"
+  }}
+}}
+The "price" field is MANDATORY for customs and must match the price returned by classify_custom_request.
+Do NOT include a "tier" number for customs — use the string "custom".
 
 Output ONLY the JSON. Reason silently. Be {persona_name}."""
 

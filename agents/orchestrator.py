@@ -64,6 +64,7 @@ async def process_message(
     message: str,
     avatar=None,
     model_profile=None,
+    active_tier_count: Optional[int] = None,
 ) -> list[BotAction]:
     """
     Route an incoming fan message through the single agent.
@@ -85,16 +86,18 @@ async def process_message(
         context = await build_context(sub, message, avatar, model_profile=model_profile)
         context["request_id"] = req_id
 
-        active_tier_count = 6
-        if model_profile and getattr(model_profile, "active_tier_count", None):
-            active_tier_count = int(model_profile.active_tier_count)
+        tier_count = active_tier_count
+        if tier_count is None:
+            tier_count = 6
+            if model_profile and getattr(model_profile, "active_tier_count", None):
+                tier_count = int(model_profile.active_tier_count)
 
         result = await single_agent_process(
             message=message,
             avatar=avatar,
             sub=sub,
             context=context,
-            active_tier_count=active_tier_count,
+            active_tier_count=tier_count,
         )
 
         messages_list = result.get("messages", []) or []
@@ -225,6 +228,7 @@ async def process_purchase(
     avatar=None,
     content_type: str = "ppv",
     model_profile=None,
+    active_tier_count: Optional[int] = None,
 ) -> list[BotAction]:
     """
     Process a confirmed purchase event. Agent generates the post-purchase
@@ -233,24 +237,33 @@ async def process_purchase(
     """
     sub.record_purchase(amount, content_type)
 
+    # ANY purchase (tier PPV, custom, continuation, tip) resets the GFE
+    # message counter so a fan who just spent money doesn't immediately hit
+    # the continuation paywall again.
+    sub.gfe_message_count = 0
+
     if content_type == "gfe_continuation" or (
         getattr(sub, "gfe_continuation_pending", False) and 15.0 <= amount <= 25.0
     ):
         sub.gfe_continuation_pending = False
-        sub.gfe_message_count = 0
+        # Re-randomize the continuation threshold so the next cycle fires at
+        # a different point (prevents deterministic "exactly 30 msgs" pattern).
+        sub.continuation_threshold_jitter = random.randint(25, 35)
 
     try:
         context = await build_context(sub, "paid", avatar, model_profile=model_profile)
-        active_tier_count = 6
-        if model_profile and getattr(model_profile, "active_tier_count", None):
-            active_tier_count = int(model_profile.active_tier_count)
+        tier_count = active_tier_count
+        if tier_count is None:
+            tier_count = 6
+            if model_profile and getattr(model_profile, "active_tier_count", None):
+                tier_count = int(model_profile.active_tier_count)
 
         result = await single_agent_process(
             message="paid",
             avatar=avatar,
             sub=sub,
             context=context,
-            active_tier_count=active_tier_count,
+            active_tier_count=tier_count,
         )
 
         actions: list[BotAction] = []
@@ -283,16 +296,20 @@ async def process_new_subscriber(
     sub: Subscriber,
     avatar=None,
     model_profile=None,
+    active_tier_count: Optional[int] = None,
 ) -> list[BotAction]:
     """Welcome a brand-new subscriber. One short opener from the agent."""
     try:
         context = await build_context(sub, "", avatar, model_profile=model_profile)
+        tier_count = active_tier_count
+        if tier_count is None:
+            tier_count = int(getattr(model_profile, "active_tier_count", 6) or 6)
         result = await single_agent_process(
             message="",
             avatar=avatar,
             sub=sub,
             context=context,
-            active_tier_count=int(getattr(model_profile, "active_tier_count", 6) or 6),
+            active_tier_count=tier_count,
         )
 
         actions: list[BotAction] = []

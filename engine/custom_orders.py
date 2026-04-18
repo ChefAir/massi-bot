@@ -154,13 +154,19 @@ STATUS_DENIED = "denied"                # Admin denied — fan can retry
 STATUS_FULFILLED = "fulfilled"          # Content delivered
 
 
-def new_order(request_text: str, custom_type: str, price: float) -> Dict:
-    """Create a new pending_custom_order dict."""
+def new_order(
+    request_text: str,
+    custom_type: str,
+    price: float,
+    platform: str = "",
+) -> Dict:
+    """Create a new pending_custom_order dict. `platform` is used in admin alerts."""
     from datetime import datetime
     return {
         "request_text": request_text[:400],
         "custom_type": custom_type,
         "quoted_price": price,
+        "platform": platform,
         "pitched_at": datetime.now().isoformat(),
         "fan_confirmed_paid_at": None,
         "admin_confirmed_at": None,

@@ -302,13 +302,17 @@ def _get_or_load_subscriber(
     display_name: str = "",
 ) -> tuple[Subscriber, bool]:
     sub = load_subscriber(PLATFORM, platform_user_id, model_id)
+    is_new = False
     if sub is None:
         sub = create_subscriber(
             PLATFORM, platform_user_id, model_id,
             username=username, display_name=display_name,
         )
-        return sub, True
-    return sub, False
+        is_new = True
+    # Stamp platform on the in-memory subscriber so custom orders +
+    # admin alerts can attribute correctly without extra plumbing.
+    sub._platform = PLATFORM
+    return sub, is_new
 
 
 # ─────────────────────────────────────────────
@@ -1066,6 +1070,10 @@ async def test_simulate_purchase(request: Request, background_tasks: BackgroundT
                 if sub.gfe_continuation_pending:
                     sub.gfe_continuation_pending = False
                     sub.gfe_continuations_paid += 1
+                    # Reset counter + re-randomize jitter so the next continuation
+                    # fires at a different point in the conversation.
+                    sub.gfe_message_count = 0
+                    sub.continuation_threshold_jitter = random.randint(25, 35)
                     logger.info(">>> GFE CONTINUATION PAID (test) by %s", fan_id)
                     actions = [BotAction(
                         action_type="send_message",
@@ -1093,10 +1101,29 @@ async def test_simulate_purchase(request: Request, background_tasks: BackgroundT
                     sub.pending_ppv = None
                 sub.custom_request_streak = 0
 
-                actions = await orchestrator_process_purchase(sub, amount_dollars, avatar, model_profile=_model_profile, active_tier_count=_active_tier_count)
+                # Custom payment detection: if pending custom order matches
+                # the amount within $5, route as content_type="custom" so
+                # ppv_count doesn't advance past it.
+                content_type = "ppv"
+                pending_custom = getattr(sub, "pending_custom_order", None)
+                if pending_custom and pending_custom.get("quoted_price"):
+                    quoted = float(pending_custom.get("quoted_price", 0))
+                    if abs(amount_dollars - quoted) <= 5.0:
+                        content_type = "custom"
+                        from engine.custom_orders import mark_fan_paid
+                        sub.pending_custom_order = mark_fan_paid(pending_custom)
+                        try:
+                            from admin_bot.alerts import alert_custom_payment_claim
+                            await alert_custom_payment_claim(sub, sub.pending_custom_order)
+                        except Exception:
+                            logger.warning("custom payment alert failed", exc_info=True)
+                        logger.info(">>> TEST PURCHASE classified as CUSTOM ($%.2f ~= quoted $%.2f)",
+                                    amount_dollars, quoted)
+
+                actions = await orchestrator_process_purchase(sub, amount_dollars, avatar, content_type=content_type, model_profile=_model_profile, active_tier_count=_active_tier_count)
 
                 save_subscriber(sub, PLATFORM, fan_id, model_id)
-                record_transaction(sub.sub_id, model_id, "ppv", amount_dollars, PLATFORM)
+                record_transaction(sub.sub_id, model_id, content_type, amount_dollars, PLATFORM)
                 logger.info(">>> TEST PURCHASE: got %d actions", len(actions) if actions else 0)
 
                 if actions:

@@ -192,6 +192,33 @@ async def alert_whale_escalation(
     await _send(text)
 
 
+async def alert_custom_payment_claim(sub, order: dict) -> None:
+    """
+    Notify admin that a fan claims they paid for a custom. Shows enough
+    identity info to find the fan on the platform: display name, @handle,
+    sub ID prefix, platform.
+    """
+    display_name = (
+        getattr(sub, "first_name", "") or getattr(sub, "display_name", "") or "Unknown"
+    ).strip() or "Unknown"
+    username = (getattr(sub, "username", "") or "").lstrip("@") or "unknown"
+    sub_id = (getattr(sub, "sub_id", "") or "")[:10]
+    platform = (order.get("platform") or getattr(sub, "_platform", "") or "unknown").lower()
+    custom_type = order.get("custom_type", "unknown")
+    quoted = order.get("quoted_price", 0.0)
+    request_text = (order.get("request_text") or "")[:200]
+
+    text = (
+        f"⚠️ <b>CUSTOM PAYMENT CONFIRMATION NEEDED</b>\n"
+        f"Fan: <b>{display_name}</b> @{username} (<code>{sub_id}</code>)\n"
+        f"Platform: {platform}\n"
+        f"Type: {custom_type}\n"
+        f"Quoted: <b>${quoted:.2f}</b>\n"
+        f"Request: <i>{request_text}</i>"
+    )
+    await _send(text)
+
+
 async def alert_content_uploaded(
     model_id: str,
     session: int,
