@@ -20,7 +20,7 @@ PRICING TIERS (6 tiers, non-negotiable feel):
   Tier 3: $77.35  - Revealing top explicitly, playing with top half
   Tier 4: $92.46  - Revealing bottom (top on, bottoms off, not too explicit)
   Tier 5: $127.45 - Fully unclothed, explicit, playing with self
-  Tier 6: $200.00 - Full out: toys, riding, climaxing (OF max PPV)
+  Tier 6: $200.00 - Full out: on her back, self-inserts dildo, climaxes (OF max PPV)
 
 Each tier PPV = 3-4 images + 1-2 videos bundled together.
 Prices use odd numbers intentionally — looks "set in stone", no negotiation.
@@ -109,9 +109,9 @@ TIER_CONFIG = {
     ContentTier.TIER_6_CLIMAX: {
         "price": 200.00,  # OF max PPV price — set in stone
         "name": "Full Climax",
-        "description": "Uses her dildo (7-inch, nude/tan) to climax. Full orgasm.",
+        "description": "Lays on her back on the bed, legs spread, and self-inserts her dildo (7-inch, nude/tan) to climax. Missionary-style self-pleasure. NOT riding, NOT grinding, NOT on top.",
         "explicitness": "maximum",
-        "what_shows": "Dildo riding, climaxing, full orgasm, nothing held back",
+        "what_shows": "On her back, self-inserting dildo missionary-style, climaxing with eye contact + moans",
         "what_doesnt_show": "N/A — this is the top tier",
         "images_per_bundle": (3, 4),
         "videos_per_bundle": (1, 2),

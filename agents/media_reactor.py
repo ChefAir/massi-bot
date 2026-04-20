@@ -1,5 +1,5 @@
 """
-Massi-Bot Multi-Agent — Media Reactor (Agent 7)
+Massi-Bot — Media Reactor (Agent 7)
 
 Reacts to media (images, voice, video, GIFs) sent by fans.
 Generates natural reaction messages — never sells, never sends PPV.

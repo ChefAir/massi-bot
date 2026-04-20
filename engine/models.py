@@ -325,6 +325,16 @@ class Subscriber:
     # Crash recovery
     last_crash_time: Optional[datetime] = None  # Set when pipeline crashes; cleared on next success
 
+    # Error / auto-recovery state (Fix 11 — every-error Telegram alerts + recovery sweep)
+    # All timestamps are ISO-8601 strings stored in qualifying_data JSONB.
+    last_error_at: Optional[str] = None              # ISO, set on pipeline error, cleared on recovery
+    last_error_context: Optional[Dict[str, Any]] = None   # {operation, error_type, error_msg, tb_snippet}
+    last_successful_bot_message_at: Optional[str] = None  # ISO, stamped on every successful send
+    unrecovered_inbound: List[Dict[str, Any]] = field(default_factory=list)  # [{text, received_at}]
+    recovery_attempts: int = 0
+    recovery_next_attempt_at: Optional[str] = None   # ISO, next scheduled retry per backoff
+    recovery_manual_only: bool = False               # True for purchase-path errors — never auto-retried
+
     # Conversation history (last N messages for context)
     recent_messages: List[Dict[str, str]] = field(default_factory=list)
 

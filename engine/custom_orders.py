@@ -67,7 +67,27 @@ def is_custom_request(message: str) -> bool:
 # ─────────────────────────────────────────────
 # Custom type classification + pricing
 # Pricing source of truth: models/{model_name}/WILLS_AND_WONTS.md
+#
+# Classification was moved from rules to the LLM agent in 2026-04-20.
+# The agent classifies `custom_type` semantically from the fan's request
+# (e.g. "picture of you riding a dildo" → pic_nude, not pic_lingerie).
+# The functions here now validate + price the agent's classification.
+# The keyword classifier is retained as a last-resort safety net.
 # ─────────────────────────────────────────────
+
+# Canonical price table. Adding a new type? Also update:
+#   * models/{model_name}/WILLS_AND_WONTS.md
+#   * The agent's classify_custom_request tool description in single_agent.py
+CUSTOM_PRICES: Dict[str, float] = {
+    "pic_lingerie": 77.38,
+    "pic_nude": 127.38,
+    "video_lingerie": 127.38,
+    "video_nude": 177.38,
+    "voice_note": 47.38,
+    "complex": 227.38,     # Weird / super-complex / longer videos — no ceiling but this is the floor
+}
+
+VALID_CUSTOM_TYPES = tuple(CUSTOM_PRICES.keys())
 
 _VIDEO_KEYWORDS = ["video", "clip", "footage", "recording", "film"]
 _PIC_KEYWORDS = ["pic", "picture", "photo", "image", "shot", "selfie"]
@@ -76,46 +96,57 @@ _LINGERIE_KEYWORDS = ["lingerie", "bra", "panties", "thong", "underwear", "robe"
 _VOICE_KEYWORDS = ["voice note", "voice message", "voice clip", "audio note", "audio message"]
 
 
-def classify_custom_type(message: str) -> Tuple[str, float]:
+def price_for_type(custom_type: str, fallback_text: str = "") -> Tuple[str, float]:
     """
-    Classify the custom request type + return price.
+    Return (canonical_type, price_dollars) for a given custom_type.
 
-    Returns (type_label, price_dollars).
+    If `custom_type` is in VALID_CUSTOM_TYPES, returns it + its canonical price
+    from the schedule. If it's unrecognised, falls back to the keyword classifier
+    over `fallback_text` (safety net), then to ("video_nude", 177.38) as the
+    premium default — we'd rather quote high and have the fan push back than
+    quote low and leave money on the table for explicit content.
+    """
+    if custom_type and custom_type in CUSTOM_PRICES:
+        return (custom_type, CUSTOM_PRICES[custom_type])
+    # Fallback path
+    if fallback_text:
+        return _classify_custom_type_keywords(fallback_text)
+    return ("video_nude", CUSTOM_PRICES["video_nude"])
 
-    Pricing (default, odd numbers for amateur feel — override in WILLS_AND_WONTS.md):
-      - Lingerie pic: $77.38
-      - Nude pic: $127.38
-      - Lingerie video: $127.38
-      - Nude video: $177.38
-      - Voice note: $47.38
-      - Ambiguous/complex (fallback): $127.38 (defaults to middle tier)
+
+def _classify_custom_type_keywords(message: str) -> Tuple[str, float]:
+    """
+    Last-resort keyword classifier. Kept for safety-net / backward compat only —
+    the LLM agent is expected to classify semantically as the primary path
+    (it can read "riding a dildo" as nude; this function cannot).
     """
     if not message:
-        return ("unknown", 127.38)
+        return ("video_nude", CUSTOM_PRICES["video_nude"])
     m = message.lower()
 
-    # Voice note check first (most specific)
     if any(kw in m for kw in _VOICE_KEYWORDS):
-        return ("voice_note", 47.38)
+        return ("voice_note", CUSTOM_PRICES["voice_note"])
 
     is_video = any(kw in m for kw in _VIDEO_KEYWORDS)
     is_pic = any(kw in m for kw in _PIC_KEYWORDS) and not is_video
     is_nude = any(kw in m for kw in _NUDE_KEYWORDS)
-    is_lingerie = any(kw in m for kw in _LINGERIE_KEYWORDS) or not is_nude
 
     if is_video:
         if is_nude:
-            return ("video_nude", 177.38)
-        return ("video_lingerie", 127.38)
+            return ("video_nude", CUSTOM_PRICES["video_nude"])
+        return ("video_lingerie", CUSTOM_PRICES["video_lingerie"])
     if is_pic:
         if is_nude:
-            return ("pic_nude", 127.38)
-        return ("pic_lingerie", 77.38)
+            return ("pic_nude", CUSTOM_PRICES["pic_nude"])
+        return ("pic_lingerie", CUSTOM_PRICES["pic_lingerie"])
 
-    # Fan didn't specify pic vs video — default to video (higher value, usually what they want)
-    if is_nude:
-        return ("video_nude", 177.38)
-    return ("video_lingerie", 127.38)
+    # Fan didn't specify medium — default to nude video (premium, usually right)
+    return ("video_nude", CUSTOM_PRICES["video_nude"])
+
+
+# Legacy shim — old callers still import this name; prefer price_for_type() for new code.
+def classify_custom_type(message: str) -> Tuple[str, float]:
+    return _classify_custom_type_keywords(message)
 
 
 # ─────────────────────────────────────────────
@@ -154,13 +185,8 @@ STATUS_DENIED = "denied"                # Admin denied — fan can retry
 STATUS_FULFILLED = "fulfilled"          # Content delivered
 
 
-def new_order(
-    request_text: str,
-    custom_type: str,
-    price: float,
-    platform: str = "",
-) -> Dict:
-    """Create a new pending_custom_order dict. `platform` is used in admin alerts."""
+def new_order(request_text: str, custom_type: str, price: float, platform: str = "") -> Dict:
+    """Create a new pending_custom_order dict."""
     from datetime import datetime
     return {
         "request_text": request_text[:400],

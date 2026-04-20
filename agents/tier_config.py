@@ -1,5 +1,5 @@
 """
-Massi-Bot Multi-Agent — Tier Configuration (Single Source of Truth)
+Massi-Bot — Tier Configuration (Single Source of Truth)
 
 All tier boundaries, prices, and content descriptions live here.
 Imported by conversation_director.py and uncensor_agent.py.

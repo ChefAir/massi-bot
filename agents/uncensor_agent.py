@@ -1,5 +1,5 @@
 """
-Massi-Bot Multi-Agent — Uncensor Agent (Agent 4)
+Massi-Bot — Uncensor Agent (Agent 4)
 
 Takes clean/implied text from the Conversation Director and makes it
 sexually explicit. Only runs for selling states — clean conversation

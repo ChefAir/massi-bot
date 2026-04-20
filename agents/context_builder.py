@@ -1,8 +1,8 @@
 """
-Massi-Bot Multi-Agent — Context Builder
+Massi-Bot — Context Builder
 
 Pre-processes subscriber data, retrieves memories, and builds structured
-context blocks that feed into all 5 agents. Runs before any LLM calls.
+context blocks that feed into the single agent. Runs before any LLM calls.
 
 No LLM calls — pure code + database queries.
 """

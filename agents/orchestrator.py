@@ -65,6 +65,7 @@ async def process_message(
     avatar=None,
     model_profile=None,
     active_tier_count: Optional[int] = None,
+    recovery_context: Optional[dict] = None,
 ) -> list[BotAction]:
     """
     Route an incoming fan message through the single agent.
@@ -85,6 +86,10 @@ async def process_message(
     try:
         context = await build_context(sub, message, avatar, model_profile=model_profile)
         context["request_id"] = req_id
+        if recovery_context:
+            # Fix 11: tell the agent it's coming back from silence so it can
+            # respond naturally to fan messages sent during the outage.
+            context["recovery_context"] = recovery_context
 
         tier_count = active_tier_count
         if tier_count is None:
@@ -155,7 +160,24 @@ async def process_message(
             is_custom = str(ppv_tier).lower() == "custom"
 
             if is_custom:
-                price = float(ppv_info.get("price", 0.0)) or 0.0
+                # Fix 13 Bug A: the tool-authoritative price lives on
+                # sub.pending_custom_order (written by classify_custom_request),
+                # not the agent's JSON echo. The agent has been known to anchor
+                # to previously-paid custom prices in conversation history, so
+                # the tool result wins. Agent's ppv.price is advisory only —
+                # logged at WARNING when the two diverge so we can track drift.
+                custom_order = getattr(sub, "pending_custom_order", None) or {}
+                tool_price = custom_order.get("quoted_price")
+                agent_price = ppv_info.get("price")
+                if tool_price:
+                    price = float(tool_price)
+                    if agent_price and abs(float(agent_price) - price) > 0.01:
+                        logger.warning(
+                            "Custom PPV price mismatch: agent said $%.2f, tool said $%.2f — using tool",
+                            float(agent_price), price,
+                        )
+                else:
+                    price = float(agent_price) if agent_price else 127.38
                 caption = ppv_info.get("caption", "just for you")
                 actions.append(BotAction(
                     action_type="send_ppv",

@@ -134,52 +134,110 @@ Ask:
 
 If they pick 2, ask for each tier's new price one at a time and validate (must be > 0). Store the final table under the model's `profile_json.tier_prices` when you create the model profile in Step 5. If they keep defaults, do nothing — the orchestrator uses the shipped defaults.
 
-### 1d. WILLS_AND_WONTS.md
+### 1d. WILLS_AND_WONTS.md — comprehensive questionnaire
 
 Tell the user:
 
 > Every model has hard limits (things she will NEVER do), soft limits (things she'll do for extra money), and a custom pricing sheet. This lives in `models/{your_model_name}/WILLS_AND_WONTS.md`. The single agent reads this file to decide custom pricing, know what to refuse, and stay consistent.
+>
+> **This is the single most important step for production safety.** Without a complete wills/won'ts, the bot will accept custom requests the model can't or won't fulfill — leading to refunds, angry fans, and potentially dangerous situations. Users can skip the questionnaire and come back to it, but the bot **MUST NOT go live with real subscribers until this file is complete**.
 
-Ask them these questions one at a time:
+Ask them the model's **stage name** first (used for the directory name, e.g., `models/jessica/`).
 
-1. **Model's stage name** (e.g., "Jessica", "Luna") — used for the directory name
-2. **Hard limits** — what the model will absolutely NEVER do on camera or in chat (e.g., "no anal, no boy/girl, no face reveals, no speaking in videos")
-3. **Soft limits** — what the model will do only for extra money or specific customers
-4. **Custom pricing** — is your pricing the same as the defaults below, or different?
-   ```
-   Voice note:        $47.38
-   Lingerie pic:      $77.38
-   Nude pic:         $127.38
-   Lingerie video:   $127.38
-   Nude video:       $177.38
-   ```
-5. **Persona notes** — any quirks the agent should maintain (favorite emoji, signature phrases, things she says about herself)
+Then walk them through every section below. For each bullet, mark it as **YES / NO / SOFT (paid extras only)**. If they say they're not sure, default to **NO** — it's safer for the agent to refuse an ambiguous request than to accept one the model can't deliver.
 
-Then create `models/{stage_name_lowercase}/WILLS_AND_WONTS.md` with this structure:
+#### Body-specific content
+- Feet pics / foot play / toe sucking?
+- Armpit content / armpit-to-mouth?
+- Belly / navel play?
+- Ass spreading / close-ups (no penetration)?
+- Spitting / saliva / drool play?
+- Squirting?
+
+#### Actions
+- Twerking / dancing?
+- Showering / bathing?
+- Oil / lotion body rubs?
+- Eating food seductively?
+- Smoking?
+- Working out content?
+- JOI (jerk-off instruction) — in chat? On video?
+- Countdown to cum?
+- Aggressive fingering? Hitting / slapping?
+- Choking self?
+
+#### Outfits / roleplay
+- Yoga pants / gym wear?
+- Bikini / swimwear?
+- Schoolgirl / nurse / maid / cosplay / uniforms? (list any yes items specifically)
+
+#### Personalization
+- Say his name (moaning)?
+- Write his name on body?
+- Wear items fans send?
+- Rate dick pics?
+- Girlfriend-experience talking videos (actually speaking, not just moaning)?
+
+#### Intensity
+- Nipple clamps / clips?
+- Wax play?
+- Multiple toys?
+- Butt plug?
+
+#### Universal hard nos (confirm each)
+- Anal?
+- Boy/girl?
+- Girl/girl?
+- Speaking in videos (vs moaning only)?
+- Video calls?
+- Physical goods shipping?
+- Minors / animals? (confirm: absolute no — this is a reject-at-first-mention category)
+
+#### Toys on hand
+- Ask the user to list every toy: color, size, type (e.g., "7-inch nude/tan dildo", "bullet vibrator, black", "wand massager, purple"). The agent will reference these by name.
+
+#### Custom pricing
+- Lingerie pic price (default $77.38)?
+- Nude pic price (default $127.38)?
+- Lingerie video price + **max length** (default $127.38, 1–2 min)?
+- Nude video price + **max length** (default $177.38, 1–2 min)?
+- Voice note price (default $47.38)?
+- Complex / weird / multi-scene bump (default $227.38 floor)?
+
+Then build `models/{stage_name_lowercase}/WILLS_AND_WONTS.md` with this structure:
 
 ```markdown
 # {Stage Name} — Wills and Wonts
 
-## Hard Limits (NEVER)
-- [limit 1]
-- [limit 2]
+## Hard Limits (NEVER — agent refuses warmly and suggests an alternative)
+- No anal
+- No boy/girl
+- [other hard limits from questionnaire answers]
 
-## Soft Limits (paid extras)
-- [limit 1]
+## Soft Limits (paid extras, agent can quote)
+- [items the user marked SOFT]
+
+## Will Do (standard content — agent can pitch freely)
+- [items marked YES]
+
+## Toys on Hand
+- [toy 1 with color + size]
+- [toy 2 with color + size]
 
 ## Custom Pricing
 - Voice note: $XX.XX
 - Lingerie pic: $XX.XX
 - Nude pic: $XX.XX
-- Lingerie video: $XX.XX
-- Nude video: $XX.XX
+- Lingerie video: $XX.XX (max length: 1–2 min)
+- Nude video: $XX.XX (max length: 1–2 min)
+- Complex / multi-scene: $XX.XX floor
 
 ## Persona Notes
-- [note 1]
-- [note 2]
+- [favorite emoji or signature phrase]
+- [things she says about herself the agent should stay consistent with]
 ```
 
-Commit this to memory by referencing it from the agent's system prompt when you build the model profile.
+The agent's system prompt includes the full hard/soft/will-do list so it checks every custom request against these boundaries before quoting. Without this step, the agent will accept anything — that's a refund risk and a fan-safety risk.
 
 ---
 

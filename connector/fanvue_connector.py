@@ -95,7 +95,7 @@ class ModelContext:
     attribution: Optional[object] = None    # AttributionEngine
     default_avatar: str = "luxury_baddie"   # Fallback avatar for this model
     stage_name: str = ""                    # For logging
-    active_tier_count: int = 6             # Number of active tiers (3 = GFE+tease only, 6 = full pipeline)
+    active_tier_count: int = 6             # Number of active tiers (3 = tease only, 6 = full pipeline)
 
 
 _avatars: Dict[str, AvatarConfig] = {}   # Shared across all models
@@ -367,6 +367,40 @@ async def startup():
         asyncio.create_task(start_sweep_loop(PLATFORM, delete_fanvue_message))
     except Exception as e:
         logger.warning("PPV cleanup sweep failed to start: %s", e)
+
+    # Error-recovery sweep: startup pass + 60s background loop (multi-model aware)
+    try:
+        from connector.recovery import run_recovery_sweep, recovery_loop
+        from admin_bot.error_alerts import alert_bot_error, alert_bot_error_resolved
+
+        def _fanvue_model_ctx(model_id_lookup: str):
+            # Find the ctx whose model_id matches; return (creator_uuid, model_profile).
+            for creator_uuid, ctx in _model_contexts.items():
+                if ctx.model_id == model_id_lookup:
+                    return (creator_uuid, ctx.model_profile)
+            return ("", None)
+
+        async def _fanvue_sweep():
+            # Each model can have its own active_tier_count; do a per-model pass.
+            for creator_uuid, ctx in list(_model_contexts.items()):
+                await run_recovery_sweep(
+                    platform=PLATFORM,
+                    model_context_lookup=lambda _mid, cu=creator_uuid, ctx=ctx: (cu, ctx.model_profile),
+                    orchestrator_process_message=orchestrator_process_message,
+                    get_avatar_fn=get_avatar,
+                    avatars_registry=_avatars,
+                    active_tier_count=ctx.active_tier_count,
+                    execute_actions_fn=execute_actions,
+                    sub_lock_factory=_get_sub_lock,
+                    send_alert_bot_error_resolved=alert_bot_error_resolved,
+                    send_alert_bot_error=alert_bot_error,
+                )
+
+        asyncio.create_task(_fanvue_sweep())
+        asyncio.create_task(recovery_loop(_fanvue_sweep, interval_seconds=60))
+        logger.info("Recovery sweep wired on Fanvue (startup + 60s loop)")
+    except Exception as e:
+        logger.warning("Recovery sweep failed to start: %s", e)
 
     logger.info("Fanvue connector started (%d models loaded, %d avatars)",
                 len(_model_contexts), len(_avatars))
@@ -715,6 +749,10 @@ async def execute_actions(
                 logger.warning("GFE-kick force-delete failed: %s", e)
         sub._force_delete_pending_ppv = None
 
+    def _mark_sent():
+        """Stamp recovery-tracking timestamp after any successful fan-visible send."""
+        sub.last_successful_bot_message_at = datetime.now().isoformat(timespec="seconds")
+
     for action in actions:
       # Per-action try/except: one action failing must NOT kill subsequent actions.
       try:
@@ -732,6 +770,7 @@ async def execute_actions(
 
         if action.action_type == "send_message" and action.message:
             await send_fanvue_message(creator_uuid, platform_user_id, action.message)
+            _mark_sent()
 
         elif action.action_type == "send_ppv":
             # Custom payment PPV — use a continuation photo as placeholder
@@ -749,10 +788,12 @@ async def execute_actions(
                         )
                         logger.info("Custom payment PPV sent: $%.2f to %s (placeholder=%s)",
                                     action.ppv_price, platform_user_id, placeholder_uuid[:12])
+                        _mark_sent()
                     else:
                         logger.warning("No continuation photo for custom PPV placeholder — sending caption only")
                         if action.ppv_caption:
                             await send_fanvue_message(creator_uuid, platform_user_id, action.ppv_caption)
+                            _mark_sent()
                 except Exception as e:
                     logger.warning("Custom PPV send failed: %s", e)
                 continue
@@ -829,6 +870,7 @@ async def execute_actions(
                 )
                 if action.ppv_caption:
                     await send_fanvue_message(creator_uuid, platform_user_id, action.ppv_caption)
+                    _mark_sent()
             else:
                 price_cents = round((action.ppv_price or 0) * 100)
                 sent_msg_uuid = await send_fanvue_ppv(
@@ -838,6 +880,7 @@ async def execute_actions(
                     fanvue_media_uuids,
                     price_cents,
                 )
+                _mark_sent()
                 # Track pending PPV for 6h auto-delete (only selling tiers 1-6, not continuation)
                 tier_meta = (action.metadata or {}).get("tier", "")
                 if sent_msg_uuid and tier_meta.startswith("tier_"):
@@ -868,6 +911,7 @@ async def execute_actions(
 
         elif action.action_type == "send_free" and action.message:
             await send_fanvue_message(creator_uuid, platform_user_id, action.message)
+            _mark_sent()
 
         elif action.action_type == "flag":
             logger.info("FLAG action for %s: %s", platform_user_id, action.metadata)
@@ -991,6 +1035,11 @@ async def _media_react(
         return actions
     except Exception as exc:
         logger.exception("Media reaction error: %s", exc)
+        try:
+            from admin_bot.error_alerts import alert_bot_error
+            await alert_bot_error("media_reactor", exc, platform=PLATFORM, model=model_id)
+        except Exception:
+            pass
         return []
 
 
@@ -1006,18 +1055,15 @@ def _get_or_load_subscriber(
 ) -> tuple[Subscriber, bool]:
     """Load subscriber from Supabase. Returns (subscriber, is_new)."""
     sub = load_subscriber(PLATFORM, platform_user_id, model_id)
-    is_new = False
     if sub is None:
         sub = create_subscriber(
             PLATFORM, platform_user_id, model_id,
             username=username, display_name=display_name,
         )
-        is_new = True
-    # Stamp platform on the in-memory subscriber so downstream code
-    # (custom order creation, admin alerts) can attribute correctly
-    # without having to thread the platform through every call site.
+        sub._platform = PLATFORM
+        return sub, True
     sub._platform = PLATFORM
-    return sub, is_new
+    return sub, False
 
 
 # ─────────────────────────────────────────────
@@ -1179,6 +1225,8 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
                 accumulated_text = message_text or ""
                 regen_count = 0
                 max_regens = 2
+                # Cancellation tokens — if fan says any of these mid-gen, don't preserve the PPV
+                _CANCEL_TOKENS = ("nvm", "nevermind", "never mind", "cancel", "wait", "hold on", "stop", "not yet", "later", "changed my mind")
                 while not is_new and regen_count < max_regens:
                     pre_send_queued = _sub_queued_messages.pop(platform_user_id, [])
                     if not pre_send_queued:
@@ -1189,20 +1237,50 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
                         break
                     logger.info(">>> REGENERATING (pass %d/%d): %d new msgs arrived -- recomposing for %s",
                                 regen_count, max_regens, len(pre_send_queued), platform_user_id)
+                    prior_ppv_actions = [a for a in (actions or []) if a.action_type == "send_ppv"]
+                    new_msgs_lower = "\n".join(pre_send_queued).lower()
+                    is_cancellation = any(tok in new_msgs_lower for tok in _CANCEL_TOKENS)
+                    # Save in-memory tool side-effects (e.g. pending_custom_order written by
+                    # classify_custom_request) BEFORE reloading from DB, or the reload wipes them.
+                    try:
+                        save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+                    except Exception as se:
+                        logger.warning("save before regen reload failed: %s", se)
                     sub = load_subscriber(PLATFORM, platform_user_id, model_id) or sub
                     avatar = get_avatar(_avatars, sub.persona_id)
                     actions = await orchestrator_process_message(sub, accumulated_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
+                    if prior_ppv_actions and not is_cancellation:
+                        has_ppv_now = any(a.action_type == "send_ppv" for a in (actions or []))
+                        if not has_ppv_now:
+                            logger.warning(
+                                ">>> Regen pass %d dropped PPV — preserving prior PPV action(s) for %s",
+                                regen_count, platform_user_id,
+                            )
+                            actions = list(actions or []) + prior_ppv_actions
 
                 logger.info(">>> Got %d actions from orchestrator", len(actions) if actions else 0)
                 save_subscriber(sub, PLATFORM, platform_user_id, model_id)
                 await execute_actions(actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
 
-                # After executing (with delays), check for EVEN MORE messages
+                # After executing (with delays), check for EVEN MORE messages.
+                # Post-gen sweep: fan often replies DURING our generation ("I appreciate that"
+                # landing while agent is drafting next message). Wait 5s + resweep to merge
+                # trickles into one pipeline run instead of firing back-to-back near-dup replies.
                 post_send_queued = _sub_queued_messages.pop(platform_user_id, [])
                 if post_send_queued:
+                    await asyncio.sleep(5)
+                    more = _sub_queued_messages.pop(platform_user_id, [])
+                    if more:
+                        post_send_queued.extend(more)
+                        logger.info(">>> Post-gen sweep merged %d extra messages for %s", len(more), platform_user_id)
                     all_follow_up = "\n".join(post_send_queued)
                     logger.info(">>> Processing %d post-send queued messages for %s",
                                 len(post_send_queued), platform_user_id)
+                    # Save tool side-effects before reloading so reload doesn't wipe them
+                    try:
+                        save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+                    except Exception as se:
+                        logger.warning("save before post-send reload failed: %s", se)
                     sub = load_subscriber(PLATFORM, platform_user_id, model_id) or sub
                     avatar = get_avatar(_avatars, sub.persona_id)
                     actions = await orchestrator_process_message(sub, all_follow_up, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
@@ -1213,8 +1291,33 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
 
             except Exception as exc:
                 logger.exception("Error handling message from %s: %s", platform_user_id, exc)
-                # Clean up queue on error
-                _sub_queued_messages.pop(platform_user_id, None)
+                # Drain queue into stuck state BEFORE losing it
+                leftover = _sub_queued_messages.pop(platform_user_id, [])
+                try:
+                    from connector.recovery import mark_stuck
+                    from admin_bot.error_alerts import alert_bot_error
+                    stuck_sub = None
+                    try:
+                        stuck_sub = load_subscriber(PLATFORM, platform_user_id, model_id)
+                    except Exception:
+                        pass
+                    if stuck_sub is not None:
+                        stuck_sub._platform = PLATFORM
+                        mark_stuck(stuck_sub, "handle_messages_received", exc, inbound_text=message_text)
+                        for extra in leftover:
+                            stuck_sub.unrecovered_inbound.append({"text": extra[:2000], "received_at": datetime.now().isoformat(timespec="seconds")})
+                        try:
+                            save_subscriber(stuck_sub, PLATFORM, platform_user_id, model_id)
+                        except Exception as se:
+                            logger.warning("Could not persist stuck state: %s", se)
+                    await alert_bot_error(
+                        "handle_messages_received", exc,
+                        sub=stuck_sub, platform=PLATFORM, model=model_id,
+                        inbound_snippet=message_text[:300],
+                        extra_context={"queued_messages": len(leftover)},
+                    )
+                except Exception as alert_exc:
+                    logger.warning("Error alerting failed (non-fatal): %s", alert_exc)
 
     background_tasks.add_task(handle)
     return JSONResponse({"status": "ok"})
@@ -1267,6 +1370,14 @@ async def webhook_new_subscriber(request: Request, background_tasks: BackgroundT
 
         except Exception as exc:
             logger.exception("Error handling new subscriber %s: %s", platform_user_id, exc)
+            try:
+                from admin_bot.error_alerts import alert_bot_error
+                await alert_bot_error(
+                    "handle_new_subscriber", exc, platform=PLATFORM, model=model_id,
+                    extra_context={"user_uuid": platform_user_id},
+                )
+            except Exception:
+                pass
 
     background_tasks.add_task(handle)
     return JSONResponse({"status": "ok"})
@@ -1308,12 +1419,11 @@ async def webhook_purchase_received(request: Request, background_tasks: Backgrou
                 if sub.gfe_continuation_pending:
                     sub.gfe_continuation_pending = False
                     sub.gfe_continuations_paid += 1
-                    # Reset counter + re-randomize jitter so the next continuation
-                    # fires at a different point (prevents an immediate re-fire).
                     sub.gfe_message_count = 0
-                    sub.continuation_threshold_jitter = random.randint(25, 35)
-                    logger.info(">>> GFE CONTINUATION PAID by %s ($%.2f) -- gate reset, continuations=%d",
-                                platform_user_id, amount_dollars, sub.gfe_continuations_paid)
+                    import random as _rnd
+                    sub.continuation_threshold_jitter = _rnd.randint(25, 35)
+                    logger.info(">>> GFE CONTINUATION PAID by %s ($%.2f) -- counter reset, next threshold=%s, continuations=%d",
+                                platform_user_id, amount_dollars, sub.continuation_threshold_jitter, sub.gfe_continuations_paid)
                     # Send a warm "welcome back" instead of normal purchase flow
                     actions = [BotAction(
                         action_type="send_message",
@@ -1351,6 +1461,9 @@ async def webhook_purchase_received(request: Request, background_tasks: Backgrou
                                     amount_dollars, quoted, platform_user_id)
                         from engine.custom_orders import mark_fan_paid
                         sub.pending_custom_order = mark_fan_paid(custom_order)
+                        sub.gfe_message_count = 0  # Reset — fan is spending, don't paywall them
+                        sub.pending_ppv = None  # Custom-payment PPV was the placeholder; fan paid, clear it
+                        sub.custom_request_streak = 0
                         save_subscriber(sub, PLATFORM, platform_user_id, model_id)
                         record_transaction(sub.sub_id, model_id, "custom", amount_dollars, PLATFORM, content_ref)
                         try:
@@ -1402,6 +1515,28 @@ async def webhook_purchase_received(request: Request, background_tasks: Backgrou
                 logger.info(">>> PURCHASE COMPLETE: ppv_count=%d total=$%.2f", sub.spending.ppv_count, sub.spending.total_spent)
             except Exception as exc:
                 logger.exception("Error handling purchase from %s: %s", platform_user_id, exc)
+                try:
+                    from connector.recovery import mark_stuck
+                    from admin_bot.error_alerts import alert_bot_error
+                    stuck_sub = None
+                    try:
+                        stuck_sub = load_subscriber(PLATFORM, platform_user_id, model_id)
+                    except Exception:
+                        pass
+                    if stuck_sub is not None:
+                        stuck_sub._platform = PLATFORM
+                        mark_stuck(stuck_sub, "handle_purchase", exc, manual_only=True)
+                        try:
+                            save_subscriber(stuck_sub, PLATFORM, platform_user_id, model_id)
+                        except Exception:
+                            pass
+                    await alert_bot_error(
+                        "handle_purchase", exc, sub=stuck_sub,
+                        platform=PLATFORM, model=model_id,
+                        extra_context={"manual_confirm_required": True},
+                    )
+                except Exception:
+                    pass
 
     background_tasks.add_task(handle)
     return JSONResponse({"status": "ok"})
@@ -1433,6 +1568,14 @@ async def webhook_tip_received(request: Request, background_tasks: BackgroundTas
             logger.info("Tip: %s sent $%.2f", platform_user_id, amount_dollars)
         except Exception as exc:
             logger.exception("Error handling tip from %s: %s", platform_user_id, exc)
+            try:
+                from admin_bot.error_alerts import alert_bot_error
+                await alert_bot_error(
+                    "handle_tip", exc, platform=PLATFORM, model=model_id,
+                    extra_context={"user_uuid": platform_user_id, "amount_dollars": amount_dollars},
+                )
+            except Exception:
+                pass
 
     background_tasks.add_task(handle)
     return JSONResponse({"status": "ok"})
@@ -1494,35 +1637,36 @@ async def test_simulate_purchase(request: Request, background_tasks: BackgroundT
                 avatar = get_avatar(_avatars, sub.persona_id)
                 logger.info(">>> TEST PURCHASE: fan=%s amount=$%.2f tier=%d", fan_uuid, amount_dollars, tier)
 
+                # Custom payment detection — same as real webhook
+                custom_order = getattr(sub, "pending_custom_order", None)
+                if custom_order and custom_order.get("status") in ("pitched", "awaiting_admin_confirm"):
+                    quoted = custom_order.get("quoted_price", 0)
+                    if abs(amount_dollars - quoted) < 5.0:
+                        logger.info(">>> TEST PURCHASE: custom payment detected $%.2f matches quoted $%.2f", amount_dollars, quoted)
+                        from engine.custom_orders import mark_fan_paid
+                        sub.pending_custom_order = mark_fan_paid(custom_order)
+                        sub.gfe_message_count = 0  # Reset — fan is spending
+                        sub.pending_ppv = None  # Custom-payment PPV was the placeholder; fan paid, clear it
+                        sub.custom_request_streak = 0
+                        save_subscriber(sub, PLATFORM, fan_uuid, model_id)
+                        record_transaction(sub.sub_id, model_id, "custom", amount_dollars, PLATFORM)
+                        try:
+                            from admin_bot.alerts import alert_custom_payment_claim
+                            await alert_custom_payment_claim(sub, sub.pending_custom_order)
+                        except Exception as e:
+                            logger.warning("Custom payment alert failed: %s", e)
+                        await send_fanvue_message(creator_uuid, fan_uuid, "got it baby, let me verify real quick and then I'll start working on your custom for you")
+                        return
+
                 # Fan paid — clear pending_ppv + reset custom streak
                 if sub.pending_ppv:
                     sub.pending_ppv = None
                 sub.custom_request_streak = 0
 
-                # Custom payment detection: if there's a pending custom order
-                # and the amount matches the quoted price within $5, route as
-                # content_type="custom" (not "ppv") so ppv_count doesn't advance.
-                content_type = "ppv"
-                pending_custom = getattr(sub, "pending_custom_order", None)
-                if pending_custom and pending_custom.get("quoted_price"):
-                    quoted = float(pending_custom.get("quoted_price", 0))
-                    if abs(amount_dollars - quoted) <= 5.0:
-                        content_type = "custom"
-                        # Mark as fan-paid + fire admin confirmation alert
-                        from engine.custom_orders import mark_fan_paid
-                        sub.pending_custom_order = mark_fan_paid(pending_custom)
-                        try:
-                            from admin_bot.alerts import alert_custom_payment_claim
-                            await alert_custom_payment_claim(sub, sub.pending_custom_order)
-                        except Exception:
-                            logger.warning("custom payment alert failed", exc_info=True)
-                        logger.info(">>> TEST PURCHASE classified as CUSTOM ($%.2f ~= quoted $%.2f)",
-                                    amount_dollars, quoted)
-
-                actions = await orchestrator_process_purchase(sub, amount_dollars, avatar, content_type=content_type, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
+                actions = await orchestrator_process_purchase(sub, amount_dollars, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
 
                 save_subscriber(sub, PLATFORM, fan_uuid, model_id)
-                record_transaction(sub.sub_id, model_id, content_type, amount_dollars, PLATFORM)
+                record_transaction(sub.sub_id, model_id, "ppv", amount_dollars, PLATFORM)
                 logger.info(">>> TEST PURCHASE: got %d actions", len(actions) if actions else 0)
 
                 if actions:
@@ -1544,6 +1688,14 @@ async def test_simulate_purchase(request: Request, background_tasks: BackgroundT
                             sub.spending.ppv_count, sub.spending.total_spent)
             except Exception as exc:
                 logger.exception("Test purchase error: %s", exc)
+                try:
+                    from admin_bot.error_alerts import alert_bot_error
+                    await alert_bot_error(
+                        "test_simulate_purchase", exc, platform=PLATFORM, model=model_id,
+                        extra_context={"fan_uuid": fan_uuid, "amount": amount_dollars},
+                    )
+                except Exception:
+                    pass
 
     background_tasks.add_task(handle)
     return JSONResponse({"status": "ok", "amount": amount_dollars, "tier": tier})

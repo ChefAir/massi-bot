@@ -1,5 +1,5 @@
 """
-Massi-Bot Multi-Agent — Parallel Guardrails
+Massi-Bot — Parallel Guardrails
 
 Pattern from Cresta Ocean-1 production architecture: safety classifiers run CONCURRENTLY
 with the voice generation, not serially after it. Concurrent execution means each

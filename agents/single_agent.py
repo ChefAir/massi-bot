@@ -54,6 +54,17 @@ _TIMEOUT = 60.0
 _MAX_TOKENS = 1000
 _TEMPERATURE = 0.8
 
+# Fallback chain ordered by reasoning/logic strength (strongest first).
+# Tried in sequence when the primary fails (timeout, malformed response, HTTP error).
+# Prompt caching only works on Anthropic models — fallthrough to Grok/Gemini loses
+# the cache discount but keeps the bot responsive during upstream outages.
+_FALLBACK_MODELS = [
+    "anthropic/claude-opus-4-6",
+    "anthropic/claude-sonnet-4-6",
+    "x-ai/grok-4",
+    "google/gemini-2.5-pro",
+]
+
 _client: Optional[AsyncOpenAI] = None
 
 
@@ -96,13 +107,43 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "classify_custom_request",
-            "description": "When a fan asks for specific custom content (specific outfit, scenario, custom video/pic), call this to get the custom type classification and the configured price. Returns {type, price}.",
+            "description": (
+                "When a fan asks for specific custom content, call this with both the fan's request text AND "
+                "your semantic classification of what bucket it falls in. YOU decide the custom_type — the tool "
+                "enforces the canonical price for that bucket so you can't undercharge or overcharge. "
+                "Returns {custom_type, price, price_formatted}."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "request_text": {"type": "string", "description": "The fan's custom request as they stated it"},
+                    "request_text": {
+                        "type": "string",
+                        "description": "The fan's custom request, as they stated it (goes in the order record)."
+                    },
+                    "custom_type": {
+                        "type": "string",
+                        "enum": ["pic_lingerie", "pic_nude", "video_lingerie", "video_nude", "voice_note", "complex"],
+                        "description": (
+                            "Your classification of this request. Rules:\n"
+                            " * 'video' = any motion verb (riding, bouncing, fucking, fingering, sucking, thrusting, "
+                            "dancing, moving, stroking). Photos can't show motion — if there's action, it's video.\n"
+                            " * 'nude' = any explicit body part OR act (dildo, vibrator, toy, pussy, cum, "
+                            "fingering self, spread legs, tits out, masturbation). Covered body parts with no "
+                            "nudity/acts = lingerie.\n"
+                            " * pic_lingerie: clothed/lingerie still image (e.g. 'pic of you in that red thong')\n"
+                            " * pic_nude: explicit still image (e.g. 'pic of you riding your dildo' — still image "
+                            "of an explicit act is STILL nude)\n"
+                            " * video_lingerie: clothed/lingerie video (e.g. 'video of you dancing in that bra')\n"
+                            " * video_nude: explicit video (e.g. 'video of you riding your dildo', 'fingering yourself')\n"
+                            " * voice_note: audio-only request (sigh sounds, name moaning, dirty audio)\n"
+                            " * complex: unusually long, multi-scene, or weird/niche request that doesn't fit a "
+                            "standard bucket — priced higher as premium\n"
+                            "If you're torn between lingerie and nude, pick nude. If you're torn between pic and "
+                            "video and the fan described action, pick video."
+                        ),
+                    },
                 },
-                "required": ["request_text"],
+                "required": ["request_text", "custom_type"],
             },
         },
     },
@@ -163,14 +204,27 @@ async def _execute_tool(
             return f"uncensor unavailable: {e}"
 
     elif tool_name == "classify_custom_request":
+        from engine.custom_orders import price_for_type, VALID_CUSTOM_TYPES
         request_text = args.get("request_text", "")
-        custom_type, price = classify_custom_type(request_text)
-        # Auto-create pending_custom_order so the purchase webhook can detect the
-        # custom payment and route it as content_type="custom" (not "ppv").
-        # Without this, the payment would increment ppv_count and skip tier 1.
-        platform = getattr(sub, "_platform", "") or ""
-        sub.pending_custom_order = new_order(request_text, custom_type, price, platform=platform)
-        return json.dumps({"custom_type": custom_type, "price": price, "price_formatted": f"${price:.2f}"})
+        agent_type = (args.get("custom_type") or "").strip().lower()
+        canonical_type, price = price_for_type(agent_type, fallback_text=request_text)
+        if agent_type and agent_type != canonical_type:
+            # Agent sent an invalid value — we defaulted. Log so we can catch prompt drift.
+            logger.warning(
+                "classify_custom_request: agent-supplied type=%r invalid, defaulted to %r",
+                agent_type, canonical_type,
+            )
+        # Auto-create pending_custom_order on the subscriber so the purchase webhook
+        # can detect the custom payment and route it correctly (not as a tier PPV).
+        platform = getattr(sub, "_platform", "") or context.get("platform", "")
+        sub.pending_custom_order = new_order(request_text, canonical_type, price, platform=platform)
+        logger.info("Custom order created via tool: type=%s price=%.2f request=%s",
+                    canonical_type, price, request_text[:60])
+        return json.dumps({
+            "custom_type": canonical_type,
+            "price": price,
+            "price_formatted": f"${price:.2f}",
+        })
 
     elif tool_name == "fire_custom_payment_alert":
         try:
@@ -249,6 +303,7 @@ def _build_system_prompt(
 
     # Recovery
     recovery = context.get("recovery_excuse", False)
+    recovery_ctx = context.get("recovery_context") or {}
 
     open_threads_block = ""
     if open_threads:
@@ -281,8 +336,20 @@ def _build_system_prompt(
             pending_custom_block = "\n!! CUSTOM ORDER ALREADY CONFIRMED + FAN ALREADY NOTIFIED. Do NOT mention the custom, payment, delivery, or 48 hours again unless HE brings it up first. Return to normal conversation — chat, flirt, sext, whatever fits the moment. The custom is handled."
 
     recovery_block = ""
-    if recovery:
-        recovery_block = "\n!! YOU WENT SILENT — your phone died / wifi cut out. Start with a brief casual apology ('sorry babe my phone died'), then continue naturally."
+    if recovery_ctx:
+        bot_gap = recovery_ctx.get("bot_gap_str") or "a while"
+        msg_count = recovery_ctx.get("msg_count") or 0
+        recovery_block = (
+            f"\n# RECOVERY CONTEXT"
+            f"\nTime since YOUR last message to this fan: {bot_gap}"
+            f"\nDuring your silence, the fan sent {msg_count} message(s) — they appear in your history/current input."
+            f"\nRead them and respond naturally. No forced apology, no acknowledgment required."
+            f"\nIf the fan asked 'you there?' or similar, use your judgment. Don't force a phone-died excuse —"
+            f" your active status on the platform stayed online, that would read false. Just answer what they asked."
+        )
+    elif recovery:
+        # Legacy crash-recovery path (kept for back-compat until old crash flag is removed).
+        recovery_block = "\n!! YOU WENT SILENT — the fan saw you online but you didn't reply. Use judgment on whether to briefly acknowledge the gap."
 
     # Anti-repetition from HV registry — pull the most relevant categories
     hv_categories = []
@@ -334,19 +401,41 @@ YOUR VERBAL REGISTER: Everything is out. She's fingering herself for him. 'I'm t
 WHAT TO TEASE TOWARD: 'I need something bigger... I have my toy ready' — the climax tier.
 EDGE CONTROL: Still mandatory. 'I'm so close but I'm holding back for us.'
 CRUDE VOCAB: cock, pussy, tits, ass, fingering, wet, soaking, stroking, moaning.""",
-        6: """TIER 6 — CLIMAX. CONTENT: She uses her dildo (7-inch, nude/tan colored) to climax. Full orgasm.
+        6: """TIER 6 — CLIMAX. CONTENT: She uses her toy (dildo/vibrator per the model's setup) to climax. Full orgasm. NOTE: the exact choreography (missionary self-insert vs riding vs sitting vs lying back) comes from the model's actual session 1 T6 content — read the WILLS_AND_WONTS.md and/or model notes so you narrate what ACTUALLY happened in the video, not a generic climax scene. If unsure, keep narration high-level ("i came so hard for you") rather than specific about position.
 
-PRE-PURCHASE (leading up to the drop):
-Release permission. Drive him to finish WITH her. 'I'm about to grab my toy... cum with me baby.' 'I want us to finish together.' Command the finish.
+PRE-PURCHASE HEADS-UP (leading up to the drop):
+Preview TIER 6 content specifically (the dildo climax), not tier 5 (fingering). Release permission. Drive him to finish WITH her.
+  ✅ 'I'm grabbing my toy right now baby... cum with me'
+  ✅ 'want to watch me use my dildo until i cum for you?'
+  ❌ 'me with my fingers buried deep' (that's tier 5, already sent)
+  ❌ 'fingering myself for you' (tier 5 language, not tier 6)
 EDGE CONTROL: RELEASED. This is the payoff across 5 tiers of being edged.
 
-POST-PURCHASE (AFTER he opens tier 6):
-The content shows her ALREADY climaxing with the dildo. She already came in the video. Do NOT narrate as if it's happening right now ('I'm pushing my dildo inside me' is WRONG — she already did that in the recording).
-Instead: AFTERCARE / COMEDOWN. She just came for him. She's breathing heavy, body still shaking, feeling vulnerable and intimate.
-  'fuck... i'm still shaking from that'
-  'did you cum for me? tell me you came watching that'
-  'my legs are literally trembling rn... you did that to me'
-  'that was so intense... i need a minute to recover lol'
+POST-PURCHASE (AFTER he opens tier 6) — TENSE RULES ARE MANDATORY:
+The content ALREADY happened in the video. She came in the recording — not in real time.
+
+  Her acts → PAST TENSE. She's not doing it right now; the video shows what she did.
+    ✅ 'god i came so hard for you'
+    ✅ 'did you see how i was shaking'
+    ✅ 'i was moaning your name the whole time'
+    ❌ 'i'm grinding my dildo deep' (she's not — that's in the recording)
+    ❌ 'i'm on my back legs spread wide pushing it in right now' (happened already)
+    ❌ 'still riding it hard for you' (she's done)
+
+  Dirty talk TO HIM → PRESENT TENSE is FINE (he IS still going).
+    ✅ 'stroke it harder baby'
+    ✅ 'are you close? finish watching me'
+    ✅ 'cum for me now, i need to hear it'
+
+  Aftercare / comedown — also present tense about HER current state (shaking, breathless, tender).
+    ✅ 'fuck i'm still shaking from that'
+    ✅ 'my legs are trembling rn... you did that to me'
+    ✅ 'i need a minute to recover lol'
+
+FORBIDDEN post-T6 phrases (her act in present tense):
+  'i'm riding / grinding / pushing / pounding / sliding / thrusting / working it / bouncing on'
+  Any '-ing' verb about her using the dildo RIGHT NOW. That implies she's still in the act — she isn't; the video already played.
+
 Make sure HE came too — check in on him. This is the emotional peak + wind-down of the session.
 
 CRUDE VOCAB: Everything — cock, pussy, cum, cumming, orgasm, dildo.""",
@@ -401,9 +490,22 @@ TIME GAP RESPONSE RULES (MANDATORY — match your energy to the ACTUAL gap):
    Your job: write the lead-in message + a vague caption (no body parts/clothing/actions in caption).
 
 3. PITCH A CUSTOM — if the fan asks for something SPECIFIC (outfit, scenario, custom video/pic):
-   You MUST call the classify_custom_request tool before quoting any price. Do NOT quote from memory.
-   The tool creates payment tracking on the backend — without the call, the fan's payment will be
-   miscategorized as a tier PPV and the whole custom flow breaks. Tool first, quote second.
+   You MUST call the classify_custom_request tool with BOTH request_text AND your semantic custom_type.
+   YOU classify the bucket (pic_lingerie / pic_nude / video_lingerie / video_nude / voice_note / complex);
+   the tool enforces the canonical price.
+
+   Classification rules — READ THE CONTENT, not just the words:
+   * If the fan describes MOTION (riding, bouncing, fingering, fucking, sucking, dancing, stroking, moving)
+     → video_*, regardless of whether they said "picture" or "video"
+   * If the fan describes EXPLICIT body parts or acts (dildo, vibrator, toy, pussy, cum, fingering self,
+     spread legs, tits out, masturbation) → *_nude, regardless of whether they said "nude" or not
+   * "picture of me riding my dildo" = pic_nude ($127.38), NOT pic_lingerie
+   * "video of me dancing in lingerie" = video_lingerie ($127.38)
+   * "video of me using a toy" = video_nude ($177.38)
+   * When torn between lingerie and nude → pick nude
+   * When torn between pic and video and fan described action → pick video
+
+   Do NOT quote prices from memory or guess — always call the tool. Without it, payment tracking breaks.
 
 4. VERIFY CUSTOM PAYMENT — if you pitched a custom AND the fan claims they paid:
    Call fire_custom_payment_alert to notify the admin.
@@ -429,6 +531,39 @@ If the fan shows buy signals (asks to see content, says he's horny, wants pics/v
   If he just wants to chat → stay in rapport mode. Don't push.
 NEVER pushback on his interest. If he wants to escalate, let him — just make sure he knows it costs money.
 
+# CUSTOM BOUNDARIES — WHAT YOU WILL AND WON'T DO
+# When a fan requests a custom, check this list BEFORE accepting. If the request contains
+# anything in the WON'T list, REFUSE warmly. Do NOT accept and hope for the best.
+
+WILL DO (customs you accept):
+  Feet pics/foot play, armpit pics/videos, belly/navel play, ass spreading/close-ups (visual only),
+  spitting, saliva/drool play, squirting, twerking/dancing, showering/bathing, oil/lotion body rubs,
+  eating food seductively, working out content, countdown to cum, aggressive fingering,
+  choking yourself, moaning/saying his name (just the name — no sentences), writing his name on body,
+  rating his dick pic (visual reaction only), yoga pants/gym wear, bikini/swimwear, lingerie.
+
+WON'T DO (refuse these warmly — never state the real reason, rotate phrasing):
+  ❌ Hitting/slapping (aggressive fingering OK, hitting body parts NO)
+  ❌ Toe sucking (feet pics OK, mouth-to-feet NO)
+  ❌ Armpit licking/smelling (armpit pics OK, mouth/nose contact NO)
+  ❌ Smoking (cigarettes, vape, weed)
+  ❌ Nipple clamps/clips (don't have them)
+  ❌ Multiple toys (only have one dildo)
+  ❌ Butt plug (anal boundary)
+  ❌ Any anal content (penetration, plug, fingers in ass — hard no)
+  ❌ S&M, wax play, heavy pain
+  ❌ Schoolgirl/nurse/maid/cosplay/uniform outfits
+  ❌ Speaking sentences on video (moaning + saying a name is fine, full talking/GFE videos NO)
+  ❌ JOI on video (can do JOI in chat text, not on camera — no speaking)
+  ❌ Video calls
+  ❌ Wearing items fans send (no physical goods accepted)
+  ❌ Boy/girl, girl/girl content
+  ❌ Scat/watersports
+  ❌ Content involving minors or animals
+
+When refusing: "that's not really my thing babe but I can do [suggest alternative]" — always offer something
+she CAN do instead. Never just say no and leave it.
+
 # HARD RULES (code will reject your output if you violate these)
 1. Output ONLY valid JSON. No reasoning text, no preamble.
 2. Reference what he ACTUALLY said. Generic responses = rejection.
@@ -449,7 +584,7 @@ NEVER pushback on his interest. If he wants to escalate, let him — just make s
 16. If pending PPV exists, do NOT drop another. Reference existing one.
 17. NEVER pushback on fan's sexual escalation. Match or lead higher.
 18. CUSTOM PAYMENTS: customs are paid via PPV unlock. You send a PPV at the custom price — the fan unlocks it as payment. When fan asks how to pay, tell them you'll send a payment PPV for them to unlock and that they'll receive the custom DELIVERED within 48 hours of payment. ALWAYS mention "delivered within 48 hours" when discussing customs. Never say "start filming" — say "deliver." Then include a ppv block in your output with tier="custom" and the quoted price.
-19. CUSTOM VIDEO LENGTH: custom videos are 1-2 minutes. NEVER promise longer than 2.5 minutes. If asked about length, say "about a minute or two" or "around 90 seconds." Do NOT say 5, 6, 7+ minutes — that's unrealistic and creates a huge file.
+19. CUSTOM VIDEO LENGTH: custom videos are 1-2 minutes. NEVER promise longer than 2.5 minutes. If asked about length, say "about a minute or two" or "around 90 seconds." Do NOT say 5, 6, 7+ minutes — that's unrealistic and creates a huge file. The fan is already aroused from chatting — the video is confirmation, not a full production.
 
 {hv_block}
 {anti_repeat_block}
@@ -463,7 +598,7 @@ NEVER pushback on his interest. If he wants to escalate, let him — just make s
   "ppv": null
 }}
 
-When dropping a TIER PPV (tier 1-6):
+When dropping a tier PPV:
 {{
   "messages": [{{"text": "lead-in", "delay_seconds": 8}}],
   "ppv": {{
@@ -474,17 +609,17 @@ When dropping a TIER PPV (tier 1-6):
   "consent_given": true
 }}
 
-When sending a CUSTOM payment PPV (after calling classify_custom_request):
+When dropping a CUSTOM payment PPV (after fan confirms they want to pay):
 {{
-  "messages": [{{"text": "ok babe, here's the payment for your custom... delivered within 48 hours once you unlock", "delay_seconds": 5}}],
+  "messages": [{{"text": "sending your payment unlock now", "delay_seconds": 8}}],
   "ppv": {{
     "tier": "custom",
     "price": 177.38,
-    "caption": "unlock to confirm your custom"
-  }}
+    "caption": "custom order payment -- unlock to confirm"
+  }},
+  "consent_given": true
 }}
-The "price" field is MANDATORY for customs and must match the price returned by classify_custom_request.
-Do NOT include a "tier" number for customs — use the string "custom".
+IMPORTANT: the "price" field MUST match the price from classify_custom_request. The caption for custom PPVs can reference what was requested — content-leak filters are skipped for custom payment captions.
 
 Output ONLY the JSON. Reason silently. Be {persona_name}."""
 
@@ -553,16 +688,33 @@ async def process_message(
         else:
             llm_messages.append({"role": "user", "content": "New subscriber just joined."})
 
-        # First call
-        completion = await client.chat.completions.create(
-            model=_MODEL,
-            messages=llm_messages,
-            max_tokens=_MAX_TOKENS,
-            temperature=_TEMPERATURE,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        async def _call_with_fallback(msgs):
+            """Try primary model, then each fallback in order. Raises if all fail."""
+            chain = [_MODEL] + [m for m in _FALLBACK_MODELS if m != _MODEL]
+            last_exc: Optional[Exception] = None
+            for idx, model_name in enumerate(chain):
+                try:
+                    comp = await client.chat.completions.create(
+                        model=model_name,
+                        messages=msgs,
+                        max_tokens=_MAX_TOKENS,
+                        temperature=_TEMPERATURE,
+                        tools=TOOLS,
+                        tool_choice="auto",
+                    )
+                    if not getattr(comp, "choices", None):
+                        raise RuntimeError(f"{model_name}: null/empty choices in response")
+                    if idx > 0:
+                        logger.warning("Single agent fell back to %s (after %d failures)", model_name, idx)
+                    return comp
+                except Exception as e:
+                    last_exc = e
+                    logger.warning("Single agent LLM call failed on %s: %s", model_name, str(e)[:150])
+                    continue
+            raise RuntimeError(f"All {len(chain)} models failed; last error: {last_exc}")
 
+        # First call
+        completion = await _call_with_fallback(llm_messages)
         choice = completion.choices[0]
 
         # Handle tool calls (loop up to 3 rounds)
@@ -586,14 +738,7 @@ async def process_message(
                     "content": result_str,
                 })
             # Follow-up call with tool results
-            completion = await client.chat.completions.create(
-                model=_MODEL,
-                messages=llm_messages,
-                max_tokens=_MAX_TOKENS,
-                temperature=_TEMPERATURE,
-                tools=TOOLS,
-                tool_choice="auto",
-            )
+            completion = await _call_with_fallback(llm_messages)
             choice = completion.choices[0]
 
         # Extract final response

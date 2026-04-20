@@ -34,6 +34,38 @@ def _bot_token() -> str:
     return os.environ["TELEGRAM_BOT_TOKEN"]
 
 
+def _notify_bot_token() -> str:
+    """Notify bot — separate from manager bot, used for time-sensitive alerts with buttons."""
+    return os.environ.get("TELEGRAM_NOTIFY_BOT_TOKEN", "")
+
+
+async def _send_with_buttons(text: str, reply_markup: dict = None) -> None:
+    """
+    Send a message via the MANAGER bot with inline keyboard buttons.
+    Used for custom payment confirmations — the two-click confirm/deny flow.
+    (NOTE: we originally planned to use the notify bot but telegram_chat.py listen
+    is already polling it for Claude Code bridge messages. The manager bot already
+    has callback_query handling via python-telegram-bot, so we use it instead.)
+    """
+    token = _bot_token()
+    admin_ids = _admin_ids()
+    if not admin_ids:
+        logger.warning("No TELEGRAM_ADMIN_IDS configured — alert with buttons dropped")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for chat_id in admin_ids:
+            try:
+                payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
+                resp = await client.post(url, json=payload)
+                if resp.status_code != 200:
+                    logger.warning("Manager bot send-with-buttons failed %d: %s", resp.status_code, resp.text[:100])
+            except Exception as exc:
+                logger.warning("Manager bot send-with-buttons exception: %s", exc)
+
+
 async def _send(text: str, parse_mode: str = "HTML") -> None:
     """
     Send a message to all admin chat IDs via the Bot API.
@@ -157,7 +189,7 @@ async def alert_whale_escalation(
       High whale      — whale_score ≥ 70 OR single purchase ≥ $100
       Mega whale      — whale_score ≥ 90 OR total_spent ≥ $500
 
-    Includes recommended action for the admin:
+    Includes recommended action for Massimo:
       Emerging → let AI run, watch closely
       High     → review conversation, consider personal touch
       Mega     → take DM personally, offer custom content
@@ -192,33 +224,6 @@ async def alert_whale_escalation(
     await _send(text)
 
 
-async def alert_custom_payment_claim(sub, order: dict) -> None:
-    """
-    Notify admin that a fan claims they paid for a custom. Shows enough
-    identity info to find the fan on the platform: display name, @handle,
-    sub ID prefix, platform.
-    """
-    display_name = (
-        getattr(sub, "first_name", "") or getattr(sub, "display_name", "") or "Unknown"
-    ).strip() or "Unknown"
-    username = (getattr(sub, "username", "") or "").lstrip("@") or "unknown"
-    sub_id = (getattr(sub, "sub_id", "") or "")[:10]
-    platform = (order.get("platform") or getattr(sub, "_platform", "") or "unknown").lower()
-    custom_type = order.get("custom_type", "unknown")
-    quoted = order.get("quoted_price", 0.0)
-    request_text = (order.get("request_text") or "")[:200]
-
-    text = (
-        f"⚠️ <b>CUSTOM PAYMENT CONFIRMATION NEEDED</b>\n"
-        f"Fan: <b>{display_name}</b> @{username} (<code>{sub_id}</code>)\n"
-        f"Platform: {platform}\n"
-        f"Type: {custom_type}\n"
-        f"Quoted: <b>${quoted:.2f}</b>\n"
-        f"Request: <i>{request_text}</i>"
-    )
-    await _send(text)
-
-
 async def alert_content_uploaded(
     model_id: str,
     session: int,
@@ -233,3 +238,49 @@ async def alert_content_uploaded(
         f"Bundle: <code>{bundle_id}</code>"
     )
     await _send(text)
+
+
+async def alert_custom_payment_claim(sub, order: dict) -> None:
+    """
+    Fan claimed payment on a pitched custom order.
+    Sends a message to the NOTIFY bot with inline keyboard buttons:
+      [✅ CONFIRM PAID]  [❌ DENY]
+    Each button requires DOUBLE-CLICK to commit (handled by the notify bot polling service).
+
+    Callback data format: "custom:{confirm|deny}:{sub_id}:{first|second}"
+    """
+    # Platform isn't on the Subscriber dataclass — check the order dict first (we store it there),
+    # then fall back to sub attribute (won't exist), then "unknown"
+    platform = order.get("platform") or getattr(sub, "platform", "unknown") or "unknown"
+    sub_id = getattr(sub, "sub_id", "?")
+    username = getattr(sub, "username", "unknown") or "unknown"
+    display_name = getattr(sub, "display_name", "") or ""
+    request = order.get("request_text", "")[:160]
+    custom_type = order.get("custom_type", "?")
+    price = order.get("quoted_price", 0)
+    pitched_at = order.get("pitched_at", "?")[:19]
+
+    # Build fan identifier — show all available info so admin can find them
+    fan_line = f"Fan: <b>{display_name}</b>" if display_name else "Fan:"
+    if username and username != "unknown":
+        fan_line += f" @{username}"
+    fan_line += f" (<code>{sub_id[:12]}</code>)"
+
+    text = (
+        "⚠️ <b>CUSTOM PAYMENT CONFIRMATION NEEDED</b>\n"
+        f"{fan_line}\n"
+        f"Platform: <b>{platform}</b>\n"
+        f"Type: {custom_type}\n"
+        f"Quoted: <b>${price:.2f}</b>\n"
+        f"Request: <i>\"{request}\"</i>\n"
+        f"Pitched at: {pitched_at}\n\n"
+        "Check the platform — did the payment actually land?\n"
+        "Click twice to commit (prevents mis-clicks)."
+    )
+    reply_markup = {
+        "inline_keyboard": [[
+            {"text": "✅ Confirm Paid", "callback_data": f"custom:confirm:{sub_id}:first"},
+            {"text": "❌ Deny", "callback_data": f"custom:deny:{sub_id}:first"},
+        ]]
+    }
+    await _send_with_buttons(text, reply_markup=reply_markup)

@@ -138,6 +138,14 @@ def _subscriber_to_row(
         "high_value_utterances_archive": sub.high_value_utterances_archive,
         "last_crash_time": _dt_to_iso(getattr(sub, 'last_crash_time', None)),
         "last_pitch_at": _dt_to_iso(sub.last_pitch_at),
+        # Error / auto-recovery state (Fix 11)
+        "last_error_at": getattr(sub, "last_error_at", None),
+        "last_error_context": getattr(sub, "last_error_context", None),
+        "last_successful_bot_message_at": getattr(sub, "last_successful_bot_message_at", None),
+        "unrecovered_inbound": getattr(sub, "unrecovered_inbound", None) or [],
+        "recovery_attempts": getattr(sub, "recovery_attempts", 0),
+        "recovery_next_attempt_at": getattr(sub, "recovery_next_attempt_at", None),
+        "recovery_manual_only": getattr(sub, "recovery_manual_only", False),
     }
 
     return {
@@ -266,6 +274,14 @@ def _row_to_subscriber(row: Dict[str, Any]) -> Subscriber:
         high_value_utterances_archive=qd.get("high_value_utterances_archive") or {},
         last_crash_time=_iso_to_dt(qd.get("last_crash_time")),
         last_pitch_at=_iso_to_dt(qd.get("last_pitch_at")),
+        # Error / auto-recovery state (Fix 11)
+        last_error_at=qd.get("last_error_at"),
+        last_error_context=qd.get("last_error_context"),
+        last_successful_bot_message_at=qd.get("last_successful_bot_message_at"),
+        unrecovered_inbound=qd.get("unrecovered_inbound") or [],
+        recovery_attempts=qd.get("recovery_attempts", 0) or 0,
+        recovery_next_attempt_at=qd.get("recovery_next_attempt_at"),
+        recovery_manual_only=bool(qd.get("recovery_manual_only", False)),
         recent_messages=row.get("recent_messages") or [],
     )
     return sub

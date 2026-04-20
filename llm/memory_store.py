@@ -83,7 +83,7 @@ logger = logging.getLogger(__name__)
 
 def _is_sim_mode() -> bool:
     """Return True if running in simulation mode (no DB writes)."""
-    return os.environ.get("UNITYLINK_SIM_MODE", "").lower() in ("true", "1", "yes")
+    return os.environ.get("MASSI_BOT_SIM_MODE", "").lower() in ("true", "1", "yes")
 
 
 # ─────────────────────────────────────────────
